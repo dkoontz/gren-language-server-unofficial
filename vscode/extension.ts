@@ -5,6 +5,7 @@ import * as child_process from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as https from "node:https";
+import { createGunzip } from "node:zlib";
 
 const REPO = "dkoontz/gren-language-server-unofficial";
 // const REPO = "lue-bird/gren-language-server-unofficial";
@@ -119,6 +120,93 @@ async function ensureServerBinary(
   return binaryPath;
 }
 
+class GrenPkgContentProvider implements vscode.TextDocumentContentProvider {
+  private cache = new Map<string, string>();
+
+  async provideTextDocumentContent(
+    uri: vscode.Uri,
+  ): Promise<string> {
+    const cached = this.cache.get(uri.toString());
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const packageName = uri.authority;
+    const moduleName = uri.path.startsWith("/")
+      ? uri.path.slice(1)
+      : uri.path;
+
+    for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
+      const grenPackagesDir = path.join(
+        workspaceFolder.uri.fsPath,
+        "gren_packages",
+      );
+      const pkgGzPath = await this.findPkgGz(grenPackagesDir, packageName);
+      if (pkgGzPath === null) {
+        continue;
+      }
+
+      const sources = await this.readPkgGzSources(pkgGzPath);
+      if (sources === null) {
+        continue;
+      }
+
+      for (const [name, source] of Object.entries(sources)) {
+        this.cache.set(
+          `gren-pkg://${packageName}/${name}`,
+          source,
+        );
+      }
+
+      const source = sources[moduleName];
+      if (source !== undefined) {
+        return source;
+      }
+    }
+
+    return `// Module ${moduleName} not found in package ${packageName}`;
+  }
+
+  private async findPkgGz(
+    grenPackagesDir: string,
+    packageName: string,
+  ): Promise<string | null> {
+    const namePrefix = packageName.replace(/[./]/g, "_") + "__";
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(grenPackagesDir);
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      if (entry.startsWith(namePrefix) && entry.endsWith(".pkg.gz")) {
+        return path.join(grenPackagesDir, entry);
+      }
+    }
+    return null;
+  }
+
+  private readPkgGzSources(pkgGzPath: string): Promise<{
+    [key: string]: string;
+  } | null> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      fs.createReadStream(pkgGzPath)
+        .pipe(createGunzip())
+        .on("data", (chunk: Buffer) => chunks.push(chunk))
+        .on("end", () => {
+          try {
+            const json = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+            resolve(json.sources ?? null);
+          } catch {
+            resolve(null);
+          }
+        })
+        .on("error", () => resolve(null));
+    });
+  }
+}
+
 export async function activate(
   context: vscode.ExtensionContext,
 ): Promise<void> {
@@ -129,6 +217,13 @@ export async function activate(
         await client.start();
       }
     }),
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(
+      "gren-pkg",
+      new GrenPkgContentProvider(),
+    ),
   );
 
   const languageServerExecutableName = await ensureServerBinary(context);
@@ -146,6 +241,10 @@ export async function activate(
       {
         scheme: "file",
         language: "json",
+      },
+      {
+        scheme: "gren-pkg",
+        language: "gren",
       },
     ],
     synchronize: {

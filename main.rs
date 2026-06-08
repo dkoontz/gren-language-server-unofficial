@@ -1158,47 +1158,53 @@ fn update_state_with_configuration(
                 })
             }
         });
-    if let Some(compiler_executable) = new_gren_path {
-        let mut gren_version_command: std::process::Command =
-            std::process::Command::new(compiler_executable);
-        gren_version_command.stdin(std::process::Stdio::null());
-        gren_version_command.stdout(std::process::Stdio::piped());
-        gren_version_command.stderr(std::process::Stdio::piped());
-        gren_version_command.arg("--version");
-        match gren_version_command.spawn() {
+    let compiler_executable = new_gren_path.unwrap_or("gren");
+    let mut gren_version_command: std::process::Command =
+        std::process::Command::new(compiler_executable);
+    gren_version_command.stdin(std::process::Stdio::null());
+    gren_version_command.stdout(std::process::Stdio::piped());
+    gren_version_command.stderr(std::process::Stdio::piped());
+    gren_version_command.arg("--version");
+    match gren_version_command.spawn() {
+        Err(error) => {
+            eprintln!(
+                "I tried to run {} but it failed: {error}. Try installing gren via `npm install -g gren-lang`.",
+                format!("{gren_version_command:?}").replace('"', "")
+            );
+        }
+        Ok(gren_version_process) => match gren_version_process.wait_with_output() {
             Err(error) => {
                 eprintln!(
-                    "I tried to run {} but it failed: {error}. Try installing gren via `npm install -g gren-lang`.",
+                    "I wasn't able to read the output of {}: {error}",
                     format!("{gren_version_command:?}").replace('"', "")
                 );
             }
-            Ok(gren_version_process) => match gren_version_process.wait_with_output() {
+            Ok(gren_make_output) => match str::from_utf8(&gren_make_output.stdout) {
                 Err(error) => {
                     eprintln!(
-                        "I wasn't able to read the output of {}: {error}",
+                        "I wasn't able to decode the output of {} as a string: {error}",
                         format!("{gren_version_command:?}").replace('"', "")
                     );
                 }
-                Ok(gren_make_output) => match str::from_utf8(&gren_make_output.stdout) {
-                    Err(error) => {
-                        eprintln!(
-                            "I wasn't able to decode the output of {} as a string: {error}",
-                            format!("{gren_version_command:?}").replace('"', "")
-                        );
-                    }
-                    Ok(gren_version) => {
-                        // since the version string is tiny
-                        // and it is leaked only once usually
-                        // this is perfectly fine
-                        state.gren_version = Box::leak(Box::from(gren_version.trim()));
-                    }
-                },
+                Ok(gren_version) => {
+                    // since the version string is tiny
+                    // and it is leaked only once usually
+                    // this is perfectly fine
+                    state.gren_version = Box::leak(Box::from(gren_version.trim()));
+                }
             },
-        }
+        },
     }
     match &state.configured {
         ConfiguredState::Received => {}
         ConfiguredState::WaitingForInitial { workspace_folders } => {
+            eprintln!(
+                "  gren compiler: {}",
+                state
+                    .configured_gren_path
+                    .as_deref()
+                    .unwrap_or("gren (from PATH)")
+            );
             initialize_projects_state_for_workspace_directories_into(
                 &mut state.projects,
                 state.gren_version,
@@ -1227,6 +1233,9 @@ fn initialize_projects_state_for_workspace_directories_into(
     let (fully_parsed_project_sender, fully_parsed_project_receiver) = std::sync::mpsc::channel();
     std::thread::scope(|thread_scope| {
         for (uninitialized_project_path, uninitialized_project_state) in projects_state.iter() {
+            if uninitialized_project_state.kind == ProjectKind::Dependency {
+                continue;
+            }
             let projects_that_finished_full_parse_sender = fully_parsed_project_sender.clone();
             thread_scope.spawn(move || {
                 projects_that_finished_full_parse_sender.send((
@@ -1242,6 +1251,37 @@ fn initialize_projects_state_for_workspace_directories_into(
     {
         if let Some(project_state_to_update) = projects_state.get_mut(&fully_parsed_project_path) {
             project_state_to_update.modules = fully_parsed_project_modules;
+        }
+    }
+    eprintln!("== gren-language-server-unofficial 0.0.2 ==");
+    eprintln!("  gren version: {gren_version}");
+    for (project_path, project_state) in projects_state.iter() {
+        eprintln!("  project: {}", project_path.display());
+        for source_dir in &project_state.source_directories {
+            eprintln!("    source directory: {}", source_dir.display());
+        }
+        eprintln!(
+            "    indexing {} modules",
+            project_state.modules.len(),
+        );
+        let mut dep_packages: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for module_origin in project_state.dependency_exposed_module_names.values() {
+            let path_str = module_origin.project_path.display().to_string();
+            if let Some(pkg_name) = path_str
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".pkg.gz"))
+            {
+                dep_packages.insert(Box::leak(pkg_name.to_string().into_boxed_str()));
+            }
+        }
+        if dep_packages.is_empty() {
+            eprintln!("    no dependency packages indexed");
+        } else {
+            for pkg in dep_packages {
+                eprintln!("    package: {pkg}");
+            }
         }
     }
 }
@@ -1260,6 +1300,55 @@ fn initialize_project_modules(
     }
     fully_parsed_modules
 }
+struct PkgGzData {
+    outline: serde_json::Value,
+    sources: std::collections::HashMap<String, String>,
+}
+
+fn read_pkg_gz(path: &std::path::Path) -> Option<PkgGzData> {
+    let compressed = std::fs::read(path).ok()?;
+    let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut decompressed = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decompressed).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decompressed).ok()?;
+    let outline = json.get("outline")?.clone();
+    let sources = json
+        .get("sources")?
+        .as_object()?
+        .iter()
+        .filter_map(|(module_name, source_value)| {
+            source_value
+                .as_str()
+                .map(|source| (module_name.clone(), source.to_string()))
+        })
+        .collect();
+    Some(PkgGzData { outline, sources })
+}
+
+fn pkg_gz_module_uri(package_name: &str, module_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("gren-pkg://{package_name}/{module_name}"))
+}
+
+fn is_pkg_gz_module_path(path: &std::path::Path) -> bool {
+    path.starts_with("gren-pkg://")
+}
+
+fn module_path_to_url(path: &std::path::Path) -> Option<lsp_types::Url> {
+    if is_pkg_gz_module_path(path) {
+        lsp_types::Url::parse(&path.to_string_lossy()).ok()
+    } else {
+        lsp_types::Url::from_file_path(path).ok()
+    }
+}
+
+fn uri_to_module_path(uri: &lsp_types::Url) -> Option<std::path::PathBuf> {
+    if uri.scheme() == "gren-pkg" {
+        Some(std::path::PathBuf::from(uri.as_str()))
+    } else {
+        uri.to_file_path().ok()
+    }
+}
+
 static gren_home_path: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
     match std::env::var("GREN_HOME") {
         Ok(gren_home_variable) => std::path::PathBuf::from(gren_home_variable),
@@ -1294,6 +1383,7 @@ fn initialize_state_for_all_projects_into(
     let mut skipped_dependencies: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     for project_path in project_paths {
+        let gren_packages_dir = std::path::Path::join(&project_path, "gren_packages");
         initialize_state_for_project_into(
             projects_state,
             &mut all_dependency_exposed_module_names,
@@ -1301,6 +1391,7 @@ fn initialize_state_for_all_projects_into(
             gren_version,
             ProjectKind::InWorkspace,
             project_path,
+            &gren_packages_dir,
         );
     }
     if !skipped_dependencies.is_empty() {
@@ -1337,6 +1428,7 @@ fn initialize_state_for_projects_into(
     gren_version: &str,
     project_kind: ProjectKind,
     project_paths: impl Iterator<Item = std::path::PathBuf>,
+    gren_packages_dir: &std::path::Path,
 ) -> std::collections::HashMap<Box<str>, ProjectModuleOrigin> {
     let mut dependency_exposed_module_names: std::collections::HashMap<
         Box<str>,
@@ -1350,6 +1442,7 @@ fn initialize_state_for_projects_into(
             gren_version,
             project_kind,
             project_path,
+            gren_packages_dir,
         ));
     }
     dependency_exposed_module_names
@@ -1364,11 +1457,25 @@ fn initialize_state_for_project_into(
     gren_version: &str,
     project_kind: ProjectKind,
     project_path: std::path::PathBuf,
+    gren_packages_dir: &std::path::Path,
 ) -> std::collections::HashMap<Box<str>, ProjectModuleOrigin> {
     if let Some(project_exposed_module_names) =
         all_dependency_exposed_module_names.get(&project_path)
     {
         return project_exposed_module_names.clone();
+    }
+    if project_path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(".pkg.gz"))
+    {
+        return initialize_state_for_pkg_gz_project_into(
+            projects_state,
+            all_dependency_exposed_module_names,
+            skipped_dependencies,
+            gren_version,
+            project_path,
+            gren_packages_dir,
+        );
     }
     let gren_json_path: std::path::PathBuf = std::path::Path::join(&project_path, "gren.json");
     let maybe_gren_json_value: Option<serde_json::Value> = std::fs::read_to_string(&gren_json_path)
@@ -1420,18 +1527,26 @@ fn initialize_state_for_project_into(
     let dependency_path = |package_name: &str, package_version_or_local_path: &str| {
         match package_version_or_local_path.strip_prefix("local:") {
             None => {
-                // https://github.com/gren-lang/compiler/blob/e907d5557065651c11fcc25b207b4b71ca9727d0/src/Git.gren#L144
+                let pkg_gz_file_name = format!(
+                    "{}__{}.pkg.gz",
+                    package_name.replace(['.', '/', '-'], "_"),
+                    package_version_or_local_path.replace('.', "_")
+                );
+                let pkg_gz_path = std::path::Path::join(gren_packages_dir, &pkg_gz_file_name);
+                if pkg_gz_path.is_file() {
+                    return pkg_gz_path;
+                }
+                // fallback to old global cache path
                 std::path::Path::join(
                     &gren_home_path,
                     format!(
                         "{gren_version}/packages/{}__{}",
-                        package_name.replace(['.', '/'], "_"),
+                        package_name.replace(['.', '/', '-'], "_"),
                         package_version_or_local_path.replace('.', "_")
                     ),
                 )
             }
             Some(local_path) => {
-                // dependency is local path
                 let project_path_not_canonical = std::path::Path::join(&project_path, local_path);
                 std::path::Path::canonicalize(&project_path_not_canonical).unwrap_or_else(|error| {
                     eprintln!(
@@ -1500,6 +1615,7 @@ fn initialize_state_for_project_into(
         gren_version,
         ProjectKind::Dependency,
         direct_dependency_paths.into_iter(),
+        gren_packages_dir,
     );
     projects_state.insert(
         project_path.clone(),
@@ -1513,6 +1629,137 @@ fn initialize_state_for_project_into(
     );
     if !exposed_module_names.is_empty() {
         all_dependency_exposed_module_names.insert(project_path, exposed_module_names.clone());
+    }
+    exposed_module_names
+}
+
+fn resolve_pkg_gz_dependency_path(
+    gren_packages_dir: &std::path::Path,
+    package_name: &str,
+) -> Option<std::path::PathBuf> {
+    let name_prefix = format!("{}__", package_name.replace(['.', '/', '-'], "_"));
+    let Ok(entries) = std::fs::read_dir(gren_packages_dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+        if file_name_str.starts_with(&name_prefix) && file_name_str.ends_with(".pkg.gz") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn initialize_state_for_pkg_gz_project_into(
+    projects_state: &mut std::collections::HashMap<std::path::PathBuf, ProjectState>,
+    all_dependency_exposed_module_names: &mut std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<Box<str>, ProjectModuleOrigin>,
+    >,
+    skipped_dependencies: &mut std::collections::HashSet<std::path::PathBuf>,
+    gren_version: &str,
+    pkg_gz_path: std::path::PathBuf,
+    gren_packages_dir: &std::path::Path,
+) -> std::collections::HashMap<Box<str>, ProjectModuleOrigin> {
+    let Some(pkg_data) = read_pkg_gz(&pkg_gz_path) else {
+        skipped_dependencies.insert(pkg_gz_path);
+        return std::collections::HashMap::new();
+    };
+    let maybe_gren_json: Option<GrenJson> = parse_gren_json(&pkg_data.outline)
+        .map_err(|error| {
+            eprintln!("I couldn't understand the outline from {:?}: {}", pkg_gz_path, error);
+        })
+        .ok();
+    let Some(gren_json) = maybe_gren_json else {
+        skipped_dependencies.insert(pkg_gz_path);
+        return std::collections::HashMap::new();
+    };
+    let package_name = pkg_data
+        .outline
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let module_states: std::collections::HashMap<std::path::PathBuf, ModuleState> = pkg_data
+        .sources
+        .into_iter()
+        .map(|(module_name, source)| {
+            let module_path = pkg_gz_module_uri(package_name, &module_name);
+            (module_path, initialize_module_state_from_source(source))
+        })
+        .collect();
+    let mut exposed_module_names: std::collections::HashMap<Box<str>, ProjectModuleOrigin> =
+        std::collections::HashMap::new();
+    if let GrenJson::Package {
+        exposed_modules,
+        dependency_minimum_versions: _,
+    } = &gren_json
+    {
+        for &exposed_module_name in exposed_modules {
+            let module_path = pkg_gz_module_uri(package_name, exposed_module_name);
+            if module_states.contains_key(&module_path) {
+                exposed_module_names.insert(
+                    Box::from(exposed_module_name),
+                    ProjectModuleOrigin {
+                        project_path: pkg_gz_path.clone(),
+                        module_path,
+                    },
+                );
+            }
+        }
+    }
+    let dependency_path_from_name = |dep_name: &str| {
+        resolve_pkg_gz_dependency_path(gren_packages_dir, dep_name)
+            .unwrap_or_else(|| {
+                std::path::Path::join(
+                    &gren_home_path,
+                    format!(
+                        "{gren_version}/packages/{}__0_0_0",
+                        dep_name.replace(['.', '/', '-'], "_"),
+                    ),
+                )
+            })
+    };
+    let direct_dependency_paths: Vec<std::path::PathBuf> = match &gren_json {
+        GrenJson::Application {
+            source_directories: _,
+            direct_dependencies,
+        } => direct_dependencies
+            .keys()
+            .map(|name| dependency_path_from_name(name))
+            .collect(),
+        GrenJson::Package {
+            dependency_minimum_versions,
+            exposed_modules: _,
+        } => dependency_minimum_versions
+            .keys()
+            .map(|name| dependency_path_from_name(name))
+            .collect(),
+    };
+    let direct_dependency_exposed_module_names: std::collections::HashMap<
+        Box<str>,
+        ProjectModuleOrigin,
+    > = initialize_state_for_projects_into(
+        projects_state,
+        all_dependency_exposed_module_names,
+        skipped_dependencies,
+        gren_version,
+        ProjectKind::Dependency,
+        direct_dependency_paths.into_iter(),
+        gren_packages_dir,
+    );
+    projects_state.insert(
+        pkg_gz_path.clone(),
+        ProjectState {
+            kind: ProjectKind::Dependency,
+            source_directories: vec![],
+            modules: module_states,
+            dependency_exposed_module_names: direct_dependency_exposed_module_names,
+            gren_make_errors: vec![],
+        },
+    );
+    if !exposed_module_names.is_empty() {
+        all_dependency_exposed_module_names.insert(pkg_gz_path, exposed_module_names.clone());
     }
     exposed_module_names
 }
@@ -1752,8 +1999,8 @@ fn state_get_project_module_by_lsp_url<'a>(
     state: &'a State,
     uri: &lsp_types::Url,
 ) -> Option<ProjectModuleState<'a>> {
-    let file_path: std::path::PathBuf = uri.to_file_path().ok()?;
-    state_get_project_module_by_path(state, &file_path)
+    let module_path: std::path::PathBuf = uri_to_module_path(uri)?;
+    state_get_project_module_by_path(state, &module_path)
 }
 fn state_get_project_module_by_path<'a>(
     state: &'a State,
@@ -1814,7 +2061,7 @@ fn respond_to_hover(
                 hovered_module_name,
             )?;
             let origin_module_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_path).ok()?;
+                module_path_to_url(origin_module_path)?;
             // also show list of exports maybe?
             Some(lsp_types::Hover {
                 contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
@@ -2939,7 +3186,7 @@ fn respond_to_goto_definition(
                     goto_module_name,
                 )?;
             let origin_module_file_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_file_path).ok()?;
+                module_path_to_url(origin_module_file_path)?;
             Some(lsp_types::GotoDefinitionResponse::Scalar(
                 lsp_types::Location {
                     uri: origin_module_file_url,
@@ -2985,7 +3232,7 @@ fn respond_to_goto_definition(
                     goto_module_name,
                 )?;
             let origin_module_file_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_file_path).ok()?;
+                module_path_to_url(origin_module_file_path)?;
             Some(lsp_types::GotoDefinitionResponse::Scalar(
                 lsp_types::Location {
                     uri: origin_module_file_url,
@@ -3132,7 +3379,7 @@ fn respond_to_goto_definition(
                     goto_module_origin,
                 )?;
             let origin_module_file_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_file_path).ok()?;
+                module_path_to_url(origin_module_file_path)?;
             let declaration_name_range: lsp_types::Range = origin_module_state
                 .syntax
                 .declarations
@@ -3259,7 +3506,7 @@ fn respond_to_goto_definition(
                     goto_module_origin,
                 )?;
             let origin_module_file_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_file_path).ok()?;
+                module_path_to_url(origin_module_file_path)?;
             let declaration_name_range: lsp_types::Range = origin_module_state
                 .syntax
                 .declarations
@@ -3370,7 +3617,7 @@ fn respond_to_goto_definition(
                     goto_module_origin,
                 )?;
             let origin_module_file_url: lsp_types::Url =
-                lsp_types::Url::from_file_path(origin_module_file_path).ok()?;
+                module_path_to_url(origin_module_file_path)?;
             let declaration_name_range: lsp_types::Range = origin_module_state
                 .syntax
                 .declarations
@@ -3685,7 +3932,7 @@ fn respond_to_rename(
             .values()
             .flat_map(|project| project.modules.iter())
             .filter_map(|(gren_module_file_path, gren_module_state)| {
-                let gren_module_uri = lsp_types::Url::from_file_path(gren_module_file_path).ok()?;
+                let gren_module_uri = module_path_to_url(gren_module_file_path)?;
                 let mut all_uses_of_renamed_module_name: Vec<lsp_types::Range> = Vec::new();
                 gren_syntax_module_uses_of_reference_into(
                     &mut all_uses_of_renamed_module_name,
@@ -3891,7 +4138,7 @@ fn renames(
                 return None;
             }
             let gren_module_uri: lsp_types::Url =
-                lsp_types::Url::from_file_path(&project_module.module_path).ok()?;
+                module_path_to_url(&project_module.module_path)?;
             Some(lsp_types::TextDocumentEdit {
                 text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
                     uri: gren_module_uri,
@@ -4042,8 +4289,7 @@ fn respond_to_references(
                     &gren_module_state.syntax,
                     GrenSymbolToReference::ModuleName(module_name_to_find),
                 );
-                lsp_types::Url::from_file_path(gren_module_file_path)
-                    .ok()
+                module_path_to_url(gren_module_file_path)
                     .map(|gren_module_uri| {
                         all_uses_of_found_module_name.into_iter().map(
                             move |use_range_of_found_module| lsp_types::Location {
@@ -4092,8 +4338,7 @@ fn respond_to_references(
                 .modules
                 .iter()
                 .flat_map(move |(project_module_path, project_module_state)| {
-                    lsp_types::Url::from_file_path(project_module_path)
-                        .ok()
+                    module_path_to_url(project_module_path)
                         .map(|gren_module_uri| {
                             let mut all_uses_of_found_at_docs_module_member: Vec<lsp_types::Range> =
                                 Vec::new();
@@ -4157,8 +4402,7 @@ fn respond_to_references(
                         &project_module_state.syntax,
                         gren_declared_symbol_to_find,
                     );
-                    lsp_types::Url::from_file_path(project_module_path)
-                        .ok()
+                    module_path_to_url(project_module_path)
                         .map(|gren_module_uri| {
                             all_uses_of_found_module_member.into_iter().map(
                                 move |use_range_of_found_module| lsp_types::Location {
@@ -4206,8 +4450,7 @@ fn respond_to_references(
                         &project_module_state.syntax,
                         gren_declared_symbol_to_find,
                     );
-                    lsp_types::Url::from_file_path(project_module_path)
-                        .ok()
+                    module_path_to_url(project_module_path)
                         .map(|gren_module_uri| {
                             all_uses_of_found_import_exposed_member.into_iter().map(
                                 move |use_range_of_found_module| lsp_types::Location {
@@ -4323,8 +4566,7 @@ fn respond_to_references(
                         &project_module_state.syntax,
                         symbol_to_find,
                     );
-                    lsp_types::Url::from_file_path(project_module_path)
-                        .ok()
+                    module_path_to_url(project_module_path)
                         .map(|gren_module_uri| {
                             all_uses_of_found_reference.into_iter().map(
                                 move |use_range_of_found_module| lsp_types::Location {
@@ -4371,8 +4613,7 @@ fn respond_to_references(
                         &project_module_state.syntax,
                         gren_declared_symbol_to_find,
                     );
-                    lsp_types::Url::from_file_path(project_module_path)
-                        .ok()
+                    module_path_to_url(project_module_path)
                         .map(|gren_module_uri| {
                             all_uses_of_found_type.into_iter().map(
                                 move |use_range_of_found_module| lsp_types::Location {
@@ -6593,7 +6834,7 @@ fn project_module_name_completions_for_except(
                               module_name: &str,
                               module_syntax: &GrenSyntaxModule|
      -> Option<lsp_types::CompletionItem> {
-        let module_url: lsp_types::Url = lsp_types::Url::from_file_path(module_path).ok()?;
+        let module_url: lsp_types::Url = module_path_to_url(module_path)?;
         Some(lsp_types::CompletionItem {
             label: module_name.to_string(),
             insert_text: Some(
