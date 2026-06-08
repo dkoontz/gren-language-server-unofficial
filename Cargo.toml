@@ -23,8 +23,9 @@ debug = "none"
 opt-level = 2
 
 [profile.release]
-# improves runtime speed by a few percent since the code doesn't unwind panics
 panic = "abort"
+lto = "thin"
+strip = true
 
 [profile.profiling]
 inherits = "release"
