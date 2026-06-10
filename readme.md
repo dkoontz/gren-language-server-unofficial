@@ -88,7 +88,14 @@ Rebuild the project with
 cargo install --debug --offline --path . gren-language-server-unofficial
 ```
 
-### log of failed optimizations
+### Install local copy of LSP
+When testing changes to the LSP or editor extensions you can symlink the LSP binary to the following locations so you do not have to copy the file after every change.
+
+#### MacOS
+VS Code: `ln -s <path-to-your-extension-repo>/target/release/gren-language-server-unofficial ~/Library/Application\ Support/Code/User/globalStorage/undefined_publisher.gren-language-server-unofficial/gren-language-server-unofficial`
+Zed: `ln -s <path-to-your-extension-repo>/target/release/gren-language-server-unofficial ~/Library/Application\ Support/Zed/extensions/work/gren_unofficial/gren-language-server-unofficial`
+
+## log of failed optimizations
 - switching to mimalloc, ~>25% faster (really nice) at the cost of 25% more memory consumption.
   Might be worth for some people but I'm already worried about our memory footprint!
 - `declarations.shrink_to_fit();` saves around 0.6% of memory at the cost of a bit of speed
@@ -96,7 +103,7 @@ cargo install --debug --offline --path . gren-language-server-unofficial
   As this prolongs installation and prevents people from quickly trying it, the default is kept.
   If this language server gets distributed as a binary or people end up using this language server a lot, this `"thin"` might become a reasonable trade-off.
 
-### optimizations to try
+## optimizations to try
 - reparse incrementally (somewhat easy to implement but somehow it's for me at least pretty much fast enough already without? More data points welcome)
 - switch to `position_encoding: Some(lsp_types::PositionEncodingKind::UTF8)`. This makes source edits and parsing easier and faster at the cost of compatibility with lsp clients below version 3.17.0. Is that acceptable? (leaning towards yes).
   Also validate if gren --report region column is UTF-8 or UTF-16 (seems to be UTF-16 strangely)
