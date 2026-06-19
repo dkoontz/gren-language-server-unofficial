@@ -1,0 +1,127 @@
+# Development tasks for the gren language server.
+#
+# `just link`    symlink the binary into Zed and VS Code
+# `just unlink`  remove those dev symlinks
+# `just status`  show the current link state
+
+# Print available recipes.
+default:
+    @just --list
+
+# ------------------------------------------------------------------------------
+# configuration
+# ------------------------------------------------------------------------------
+
+# Locally built language-server binary that the editor symlinks point at.
+# Built with `just build`. For fast dev rebuilds, build debug and point this at
+# target/debug/gren-language-server-unofficial instead.
+BINARY := justfile_directory() + "/target/release/gren-language-server-unofficial"
+
+# Language-server binary name (must match the editors' expected name).
+BIN_NAME := "gren-language-server-unofficial"
+
+# macOS Zed extension work directory (matches extension id "gren_unofficial").
+# Zed runs the extension with this as its CWD, so both `download_file` and the
+# dev symlink must live here.
+ZED_DIR := env_var("HOME") + "/Library/Application Support/Zed/extensions/work/gren_unofficial"
+
+# macOS VS Code globalStorage directory. "undefined_publisher" is literal:
+# vscode/package.json declares no `publisher` field, so VS Code uses this as the
+# storage prefix.
+VSCODE_DIR := env_var("HOME") + "/Library/Application Support/Code/User/globalStorage/undefined_publisher.gren-language-server-unofficial"
+
+# ------------------------------------------------------------------------------
+# build
+# ------------------------------------------------------------------------------
+
+# Build the language server (optimized release binary).
+build:
+    cargo build --release
+
+# ------------------------------------------------------------------------------
+# symlinks
+# ------------------------------------------------------------------------------
+
+# Link the binary into both Zed and VS Code.
+link: link-zed link-vscode
+
+# Remove the dev symlinks from both editors.
+unlink: unlink-zed unlink-vscode
+
+# Link the built binary into Zed's dev extension work directory.
+link-zed:
+    #!/usr/bin/env sh
+    set -eu
+    target="{{ZED_DIR}}/{{BIN_NAME}}"
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+        echo "zed: refusing to link — '$target' is an existing directory." >&2
+        echo "     remove it manually if that is intended, then re-run." >&2
+        exit 1
+    fi
+    mkdir -p "{{ZED_DIR}}"
+    rm -f "$target"
+    ln -s "{{BINARY}}" "$target"
+    echo "zed:    $target -> {{BINARY}}"
+
+# Link the built binary into VS Code's globalStorage. Also writes the `version`
+# file VS Code requires (extension.ts checks it) to use the binary instead of
+# re-downloading and clobbering the symlink.
+link-vscode:
+    #!/usr/bin/env sh
+    set -eu
+    target="{{VSCODE_DIR}}/{{BIN_NAME}}"
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+        echo "vscode: refusing to link — '$target' is an existing directory." >&2
+        echo "        remove it manually if that is intended, then re-run." >&2
+        exit 1
+    fi
+    mkdir -p "{{VSCODE_DIR}}"
+    rm -f "$target"
+    ln -s "{{BINARY}}" "$target"
+    version=$(jq -r .version "{{justfile_directory()}}/vscode/package.json")
+    echo "$version" > "{{VSCODE_DIR}}/version"
+    echo "vscode: $target -> {{BINARY}} (version $version)"
+
+# Remove the Zed dev symlink (leaves a real directory in place).
+unlink-zed:
+    #!/usr/bin/env sh
+    target="{{ZED_DIR}}/{{BIN_NAME}}"
+    if [ -L "$target" ]; then
+        rm "$target"
+        echo "removed $target"
+    elif [ -d "$target" ]; then
+        echo "zed: '$target' is a directory, not a symlink; leaving it in place." >&2
+    else
+        echo "zed: nothing to unlink at $target"
+    fi
+
+# Remove the VS Code dev symlink and its version file.
+unlink-vscode:
+    #!/usr/bin/env sh
+    target="{{VSCODE_DIR}}/{{BIN_NAME}}"
+    if [ -L "$target" ]; then
+        rm "$target"
+        rm -f "{{VSCODE_DIR}}/version"
+        echo "removed $target"
+    elif [ -d "$target" ]; then
+        echo "vscode: '$target' is a directory, not a symlink; leaving it in place." >&2
+    else
+        echo "vscode: nothing to unlink at $target"
+    fi
+
+# Show the current link state for each editor.
+status:
+    #!/usr/bin/env sh
+    for pair in "zed|{{ZED_DIR}}/{{BIN_NAME}}" "vscode|{{VSCODE_DIR}}/{{BIN_NAME}}"; do
+        target=${pair#*|}
+        name=${pair%|*}
+        if [ -L "$target" ]; then
+            echo "$name: -> $(readlink "$target")"
+        elif [ -d "$target" ]; then
+            echo "$name: directory present at '$target' (remove it before linking)"
+        elif [ -e "$target" ]; then
+            echo "$name: file present (not a symlink) at '$target'"
+        else
+            echo "$name: not linked"
+        fi
+    done

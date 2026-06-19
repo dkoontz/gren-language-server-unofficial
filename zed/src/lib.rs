@@ -8,6 +8,9 @@ const REPO: &str = "dkoontz/gren-language-server-unofficial";
 
 const VERSION: &str = "0.0.2";
 
+const BIN_NAME: &str = "gren-language-server-unofficial";
+const DOWNLOAD_DIR: &str = "lsp";
+
 struct GrenUnofficialZedExtension {
     did_attempt_download: bool,
 }
@@ -24,17 +27,16 @@ impl zed::Extension for GrenUnofficialZedExtension {
         language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        let binary_path = "gren-language-server-unofficial";
-        if std::path::Path::new(binary_path).exists() {
-            return Ok(zed::Command::new(binary_path));
+        if std::path::Path::new(BIN_NAME).is_file() {
+            return Ok(zed::Command::new(BIN_NAME));
         }
-        if let Some(path) = worktree.which("gren-language-server-unofficial") {
+        let downloaded_binary = format!("{DOWNLOAD_DIR}/{BIN_NAME}");
+        if std::path::Path::new(&downloaded_binary).is_file() {
+            return Ok(zed::Command::new(downloaded_binary));
+        }
+        if let Some(path) = worktree.which(BIN_NAME) {
             return Ok(zed::Command::new(path));
         }
-        if self.did_attempt_download {
-            return Err("executable gren-language-server-unofficial not found in the PATH environment and could not be downloaded".into());
-        }
-        self.did_attempt_download = true;
 
         let (os, arch) = current_platform();
         let target = match (os, arch) {
@@ -48,31 +50,38 @@ impl zed::Extension for GrenUnofficialZedExtension {
             }
         };
 
+        let (archive_ext, file_type) = if target.contains("windows") {
+            ("zip", DownloadedFileType::Zip)
+        } else {
+            ("tar.gz", DownloadedFileType::GzipTar)
+        };
+        let url = format!(
+            "https://github.com/{REPO}/releases/download/v{VERSION}/{BIN_NAME}-{target}.{archive_ext}"
+        );
+
+        if self.did_attempt_download {
+            return Err(format!(
+                "executable {BIN_NAME} not found in the PATH environment and could not be downloaded"
+            ).into());
+        }
+        self.did_attempt_download = true;
+
         set_language_server_installation_status(
             language_server_id,
             &LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let archive_ext = if target.contains("windows") {
-            "zip"
-        } else {
-            "tar.gz"
-        };
-        let url = format!(
-            "https://github.com/{REPO}/releases/download/v{VERSION}/gren-language-server-unofficial-{target}.{archive_ext}"
-        );
-
-        download_file(&url, binary_path, DownloadedFileType::GzipTar)
+        download_file(&url, DOWNLOAD_DIR, file_type)
             .map_err(|e| format!("failed to download language server: {e}"))?;
 
-        make_file_executable(binary_path)?;
+        make_file_executable(&downloaded_binary)?;
 
         set_language_server_installation_status(
             language_server_id,
             &LanguageServerInstallationStatus::None,
         );
 
-        Ok(zed::Command::new(binary_path.to_string()))
+        Ok(zed::Command::new(downloaded_binary))
     }
 
     fn language_server_initialization_options(
