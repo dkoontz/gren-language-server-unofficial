@@ -45,6 +45,32 @@ struct ModuleState {
     source: String,
 }
 
+fn resolve_gren_executable(name: &str) -> String {
+    let path = std::path::Path::new(name);
+    if path.extension().is_some()
+        || path.parent().filter(|p| p.as_os_str() != "").is_some()
+    {
+        return name.to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(path_var) = std::env::var("PATH") {
+            if let Ok(pathext) = std::env::var("PATHEXT") {
+                for dir in path_var.split(';') {
+                    for ext in pathext.split(';') {
+                        let exe_path =
+                            std::path::Path::new(dir).join(format!("{name}{ext}"));
+                        if exe_path.is_file() {
+                            return exe_path.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    name.to_string()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (connection, io_thread) = lsp_server::Connection::stdio();
 
@@ -877,7 +903,8 @@ fn compute_diagnostics(
         "windows" => "NUL",
         _ => "/dev/null",
     };
-    let compiler_executable_name: &str = configured_gren_path.unwrap_or("gren");
+    let compiler_executable_name: String =
+        resolve_gren_executable(configured_gren_path.unwrap_or("gren"));
     let project_module_names = project_state.modules.values().filter_map(|module_state| {
         module_state
             .syntax
@@ -887,7 +914,7 @@ fn compute_diagnostics(
             .map(|name_node| name_node.value.as_ref())
     });
     let mut gren_make_command: std::process::Command =
-        std::process::Command::new(compiler_executable_name);
+        std::process::Command::new(&compiler_executable_name);
     gren_make_command.args(
         std::iter::once("make")
             .chain(project_module_names)
@@ -1158,9 +1185,9 @@ fn update_state_with_configuration(
                 })
             }
         });
-    let compiler_executable = new_gren_path.unwrap_or("gren");
+    let compiler_executable = resolve_gren_executable(new_gren_path.unwrap_or("gren"));
     let mut gren_version_command: std::process::Command =
-        std::process::Command::new(compiler_executable);
+        std::process::Command::new(&compiler_executable);
     gren_version_command.stdin(std::process::Stdio::null());
     gren_version_command.stdout(std::process::Stdio::piped());
     gren_version_command.stderr(std::process::Stdio::piped());
@@ -6403,8 +6430,9 @@ fn format_using_gren_format(
     project_path: &std::path::Path,
     source: &str,
 ) -> Option<String> {
+    let resolved_format_path = resolve_gren_executable(configured_gren_format_path);
     let mut gren_format_cmd: std::process::Command =
-        std::process::Command::new(configured_gren_format_path);
+        std::process::Command::new(&resolved_format_path);
     gren_format_cmd
         .args(["--stdin", "--gren-version", "0.19", "--yes"])
         .current_dir(project_path)
