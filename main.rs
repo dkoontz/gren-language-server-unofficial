@@ -47,9 +47,7 @@ struct ModuleState {
 
 fn resolve_gren_executable(name: &str) -> String {
     let path = std::path::Path::new(name);
-    if path.extension().is_some()
-        || path.parent().filter(|p| p.as_os_str() != "").is_some()
-    {
+    if path.extension().is_some() || path.parent().filter(|p| p.as_os_str() != "").is_some() {
         return name.to_string();
     }
     #[cfg(target_os = "windows")]
@@ -58,8 +56,7 @@ fn resolve_gren_executable(name: &str) -> String {
             if let Ok(pathext) = std::env::var("PATHEXT") {
                 for dir in path_var.split(';') {
                     for ext in pathext.split(';') {
-                        let exe_path =
-                            std::path::Path::new(dir).join(format!("{name}{ext}"));
+                        let exe_path = std::path::Path::new(dir).join(format!("{name}{ext}"));
                         if exe_path.is_file() {
                             return exe_path.to_string_lossy().to_string();
                         }
@@ -81,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             capabilities: server_capabilities(),
             server_info: Some(lsp_types::ServerInfo {
                 name: "gren-language-server-unofficial".to_string(),
-                version: Some("0.0.2".to_string()),
+                version: Some("0.0.3".to_string()),
             }),
         })?,
     )?;
@@ -1280,19 +1277,15 @@ fn initialize_projects_state_for_workspace_directories_into(
             project_state_to_update.modules = fully_parsed_project_modules;
         }
     }
-    eprintln!("== gren-language-server-unofficial 0.0.2 ==");
+    eprintln!("== gren-language-server-unofficial 0.0.3 ==");
     eprintln!("  gren version: {gren_version}");
     for (project_path, project_state) in projects_state.iter() {
         eprintln!("  project: {}", project_path.display());
         for source_dir in &project_state.source_directories {
             eprintln!("    source directory: {}", source_dir.display());
         }
-        eprintln!(
-            "    indexing {} modules",
-            project_state.modules.len(),
-        );
-        let mut dep_packages: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        eprintln!("    indexing {} modules", project_state.modules.len(),);
+        let mut dep_packages: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for module_origin in project_state.dependency_exposed_module_names.values() {
             let path_str = module_origin.project_path.display().to_string();
             if let Some(pkg_name) = path_str
@@ -1695,7 +1688,10 @@ fn initialize_state_for_pkg_gz_project_into(
     };
     let maybe_gren_json: Option<GrenJson> = parse_gren_json(&pkg_data.outline)
         .map_err(|error| {
-            eprintln!("I couldn't understand the outline from {:?}: {}", pkg_gz_path, error);
+            eprintln!(
+                "I couldn't understand the outline from {:?}: {}",
+                pkg_gz_path, error
+            );
         })
         .ok();
     let Some(gren_json) = maybe_gren_json else {
@@ -1736,16 +1732,15 @@ fn initialize_state_for_pkg_gz_project_into(
         }
     }
     let dependency_path_from_name = |dep_name: &str| {
-        resolve_pkg_gz_dependency_path(gren_packages_dir, dep_name)
-            .unwrap_or_else(|| {
-                std::path::Path::join(
-                    &gren_home_path,
-                    format!(
-                        "{gren_version}/packages/{}__0_0_0",
-                        dep_name.replace(['.', '/', '-'], "_"),
-                    ),
-                )
-            })
+        resolve_pkg_gz_dependency_path(gren_packages_dir, dep_name).unwrap_or_else(|| {
+            std::path::Path::join(
+                &gren_home_path,
+                format!(
+                    "{gren_version}/packages/{}__0_0_0",
+                    dep_name.replace(['.', '/', '-'], "_"),
+                ),
+            )
+        })
     };
     let direct_dependency_paths: Vec<std::path::PathBuf> = match &gren_json {
         GrenJson::Application {
@@ -2087,8 +2082,7 @@ fn respond_to_hover(
                 hovered_project_module_state.project,
                 hovered_module_name,
             )?;
-            let origin_module_url: lsp_types::Url =
-                module_path_to_url(origin_module_path)?;
+            let origin_module_url: lsp_types::Url = module_path_to_url(origin_module_path)?;
             // also show list of exports maybe?
             Some(lsp_types::Hover {
                 contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
@@ -4164,8 +4158,7 @@ fn renames(
             if all_uses.is_empty() {
                 return None;
             }
-            let gren_module_uri: lsp_types::Url =
-                module_path_to_url(&project_module.module_path)?;
+            let gren_module_uri: lsp_types::Url = module_path_to_url(&project_module.module_path)?;
             Some(lsp_types::TextDocumentEdit {
                 text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
                     uri: gren_module_uri,

@@ -1,8 +1,8 @@
 id = "gren_unofficial"
 name = "gren unofficial"
-version = "0.0.2"
+version = "0.0.3"
 schema_version = 1
-authors = ["lue-bird (lsp)", "Mae Brooks (treesitter)"]
+authors = ["lue-bird (lsp)", "Mae Brooks (treesitter)", "David Koontz (LSP, Treesitter)"]
 description = "gren programming language support"
 repository = "https://github.com/lue-bird/gren-language-server-unofficial"
 
