@@ -65,7 +65,7 @@ auto-format = true
 ```
 
 ## not planned
-- type inference
+- full type inference (hover does resolve the type of a local pattern binding such as `when user is Named name ->` when the matched expression's type can be derived from annotations)
 - directly integrating test running and similar
 - codelens, workspace symbols, code folding, linked editing
 - `gren.json` help

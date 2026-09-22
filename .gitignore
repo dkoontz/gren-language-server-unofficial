@@ -28,3 +28,5 @@ zombie
 perf.data
 testing/
 run-profiling.sh
+
+.DS_Store

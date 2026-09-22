@@ -2722,6 +2722,95 @@ fn respond_to_hover(
             }),
             range: Some(hovered_symbol_node.range),
         }),
+        GrenSyntaxSymbol::RecordFieldAccess {
+            record_expression: hovered_record_expression,
+            field_name: hovered_field_name,
+            local_bindings,
+        } => {
+            let type_resolution: LocalBindingTypeResolution = local_binding_type_resolution(
+                state,
+                hovered_project_module_state.project,
+                &hovered_project_module_state.module.syntax,
+            );
+            let record_type: GrenResolvedTypeInModule = local_binding_expression_type(
+                &type_resolution,
+                &local_bindings,
+                hovered_record_expression,
+                0,
+            )?;
+            let field_type: GrenResolvedTypeInModule = local_binding_record_field_type(
+                &type_resolution,
+                &record_type,
+                hovered_field_name,
+                0,
+            )?;
+            Some(lsp_types::Hover {
+                contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value: local_binding_type_info_markdown(
+                        &type_resolution,
+                        hovered_field_name,
+                        &field_type.type_,
+                        &field_type.origin_module,
+                        hovered_symbol_node.range,
+                    ),
+                }),
+                range: Some(hovered_symbol_node.range),
+            })
+        }
+        GrenSyntaxSymbol::RecordLiteralFieldName {
+            field_name: hovered_field_name,
+            field_value: hovered_field_value,
+            local_bindings,
+        } => {
+            let type_resolution: LocalBindingTypeResolution = local_binding_type_resolution(
+                state,
+                hovered_project_module_state.project,
+                &hovered_project_module_state.module.syntax,
+            );
+            // prefer the expected type, e.g. from the parameter of the surrounding call
+            let maybe_resolved_type: Option<GrenResolvedTypeInModule> =
+                local_binding_expected_type_at_position(
+                    &type_resolution,
+                    hovered_symbol_node.range.start,
+                )
+                .or_else(|| match hovered_field_value {
+                    Some(field_value_node) => local_binding_expression_type(
+                        &type_resolution,
+                        &local_bindings,
+                        field_value_node,
+                        0,
+                    ),
+                    // punned record field: `{ name }` uses the local binding `name`
+                    None => {
+                        find_local_binding_scope_expression(
+                            &local_bindings,
+                            hovered_field_name,
+                        )
+                        .and_then(|(local_binding_origin, _)| {
+                            local_binding_local_origin_type(
+                                &type_resolution,
+                                local_binding_origin,
+                                0,
+                            )
+                        })
+                    }
+                });
+            let resolved_type: GrenResolvedTypeInModule = maybe_resolved_type?;
+            Some(lsp_types::Hover {
+                contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+                    kind: lsp_types::MarkupKind::Markdown,
+                    value: local_binding_type_info_markdown(
+                        &type_resolution,
+                        hovered_field_name,
+                        &resolved_type.type_,
+                        &resolved_type.origin_module,
+                        hovered_symbol_node.range,
+                    ),
+                }),
+                range: Some(hovered_symbol_node.range),
+            })
+        }
         GrenSyntaxSymbol::VariableOrVariantOrOperator {
             qualification: hovered_qualification,
             name: hovered_name,
@@ -3053,25 +3142,72 @@ fn local_binding_info_markdown(
     binding_origin: LocalBindingOrigin,
 ) -> String {
     match binding_origin {
-        LocalBindingOrigin::PatternVariable(_) => "variable introduced in pattern".to_string(),
-        LocalBindingOrigin::PatternRecordField(_) => {
-            "variable bound to a field, introduced in a pattern".to_string()
+        LocalBindingOrigin::PatternVariable(name_range) => {
+            let type_resolution: LocalBindingTypeResolution =
+                local_binding_type_resolution(state, project_state, module_syntax);
+            match local_binding_resolved_type_markdown(
+                &type_resolution,
+                binding_name,
+                name_range,
+            ) {
+                Some(resolved_type_markdown) => resolved_type_markdown,
+                None => "variable introduced in pattern".to_string(),
+            }
+        }
+        LocalBindingOrigin::PatternRecordField(name_range) => {
+            let type_resolution: LocalBindingTypeResolution =
+                local_binding_type_resolution(state, project_state, module_syntax);
+            match local_binding_resolved_type_markdown(
+                &type_resolution,
+                binding_name,
+                name_range,
+            ) {
+                Some(resolved_type_markdown) => resolved_type_markdown,
+                None => "variable bound to a field, introduced in a pattern".to_string(),
+            }
         }
         LocalBindingOrigin::LetDeclaredVariable {
             signature: maybe_signature,
             start_name_range,
-        } => let_declaration_info_markdown(
-            state,
-            project_state,
-            module_syntax,
-            GrenSyntaxNode {
-                value: binding_name,
-                range: start_name_range,
-            },
-            maybe_signature
+        } => {
+            let maybe_signature_type = maybe_signature
                 .and_then(|signature| signature.type_.as_ref())
-                .map(gren_syntax_node_as_ref),
-        ),
+                .map(gren_syntax_node_as_ref);
+            match maybe_signature_type {
+                Some(signature_type) => let_declaration_info_markdown(
+                    state,
+                    project_state,
+                    module_syntax,
+                    GrenSyntaxNode {
+                        value: binding_name,
+                        range: start_name_range,
+                    },
+                    Some(signature_type),
+                ),
+                None => {
+                    // no signature: the let declaration's expression decides the type
+                    let type_resolution: LocalBindingTypeResolution =
+                        local_binding_type_resolution(state, project_state, module_syntax);
+                    match local_binding_resolved_type_markdown(
+                        &type_resolution,
+                        binding_name,
+                        start_name_range,
+                    ) {
+                        Some(resolved_type_markdown) => resolved_type_markdown,
+                        None => let_declaration_info_markdown(
+                            state,
+                            project_state,
+                            module_syntax,
+                            GrenSyntaxNode {
+                                value: binding_name,
+                                range: start_name_range,
+                            },
+                            None,
+                        ),
+                    }
+                }
+            }
+        }
     }
 }
 fn let_declaration_info_markdown(
@@ -3112,6 +3248,2584 @@ fn let_declaration_info_markdown(
             )
         }
     }
+}
+
+// resolve the type of pattern-introduced local bindings, syntax-only and best-effort:
+// find what the introducing pattern is matched against
+// (the scrutinized expression of a `when <expression> is`,
+//  the expression of a destructuring `let <pattern> = <expression>`
+//  or a declaration parameter) and walk the pattern down to the hovered binding,
+// transforming the type on the way.
+// This is no type inference: sources without fitting annotations stay unresolved.
+const local_type_resolution_recursion_depth_limit: u8 = 24;
+
+enum GrenPatternMatched<'a> {
+    Expression(GrenSyntaxNode<&'a GrenSyntaxExpression>),
+    DeclarationParameter {
+        signature: Option<&'a GrenSyntaxVariableDeclarationSignature>,
+        parameter_index: usize,
+    },
+    Unknown,
+}
+struct GrenPatternIntroduction<'a> {
+    // None when the introduction is not a pattern, e.g. a let-declared variable
+    root_pattern: Option<GrenSyntaxNode<&'a GrenSyntaxPattern>>,
+    matched: GrenPatternMatched<'a>,
+    // bindings in scope where the pattern is introduced, used to resolve references
+    // in the matched expression
+    local_bindings: GrenLocalBindings<'a>,
+}
+
+fn gren_syntax_module_find_pattern_introduction<'a>(
+    gren_syntax_module: &'a GrenSyntaxModule,
+    binding_name_range: lsp_types::Range,
+) -> Option<GrenPatternIntroduction<'a>> {
+    gren_syntax_module
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .find_map(|documented_declaration| {
+            let declaration_node = documented_declaration.declaration.as_ref()?;
+            gren_syntax_declaration_find_pattern_introduction(
+                gren_syntax_node_as_ref(declaration_node),
+                binding_name_range,
+            )
+        })
+}
+fn gren_syntax_declaration_find_pattern_introduction<'a>(
+    gren_syntax_declaration_node: GrenSyntaxNode<&'a GrenSyntaxDeclaration>,
+    binding_name_range: lsp_types::Range,
+) -> Option<GrenPatternIntroduction<'a>> {
+    let GrenSyntaxDeclaration::Variable {
+        start_name: _,
+        signature,
+        parameters,
+        equals_key_symbol_range: _,
+        result: maybe_result,
+    } = gren_syntax_declaration_node.value
+    else {
+        return None;
+    };
+    let mut local_bindings: GrenLocalBindings<'a> = Vec::new();
+    for (parameter_index, parameter_node) in parameters.iter().enumerate() {
+        if let Some(introduction) = gren_syntax_pattern_root_find_pattern_introduction(
+            GrenPatternMatched::DeclarationParameter {
+                signature: signature.as_ref(),
+                parameter_index,
+            },
+            &local_bindings,
+            gren_syntax_node_as_ref(parameter_node),
+            binding_name_range,
+        ) {
+            return Some(introduction);
+        }
+        gren_syntax_pattern_bindings_for_scope_into(
+            &mut local_bindings,
+            maybe_result.as_ref().map(gren_syntax_node_as_ref),
+            gren_syntax_node_as_ref(parameter_node),
+        );
+    }
+    match maybe_result {
+        Some(result_node) => gren_syntax_expression_find_pattern_introduction(
+            &mut local_bindings,
+            gren_syntax_node_as_ref(result_node),
+            binding_name_range,
+        ),
+        None => None,
+    }
+}
+fn gren_syntax_expression_find_pattern_introduction<'a>(
+    local_bindings: &mut GrenLocalBindings<'a>,
+    gren_syntax_expression_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    binding_name_range: lsp_types::Range,
+) -> Option<GrenPatternIntroduction<'a>> {
+    if !lsp_range_includes_position(gren_syntax_expression_node.range, binding_name_range.start) {
+        return None;
+    }
+    match gren_syntax_expression_node.value {
+        GrenSyntaxExpression::Call {
+            called,
+            argument0,
+            argument1_up,
+        } => {
+            if let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_unbox(called),
+                binding_name_range,
+            ) {
+                return Some(introduction);
+            }
+            if let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_unbox(argument0),
+                binding_name_range,
+            ) {
+                return Some(introduction);
+            }
+            argument1_up.iter().find_map(|argument_node| {
+                gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_as_ref(argument_node),
+                    binding_name_range,
+                )
+            })
+        }
+        GrenSyntaxExpression::WhenIs {
+            matched: maybe_matched,
+            is_keyword_range: _,
+            cases,
+        } => {
+            if let Some(matched_node) = maybe_matched
+                && let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(matched_node),
+                    binding_name_range,
+                )
+            {
+                return Some(introduction);
+            }
+            cases.iter().find_map(|case| {
+                if let Some(introduction) = gren_syntax_pattern_root_find_pattern_introduction(
+                    match maybe_matched.as_ref() {
+                        Some(matched_node) => {
+                            GrenPatternMatched::Expression(gren_syntax_node_unbox(matched_node))
+                        }
+                        None => GrenPatternMatched::Unknown,
+                    },
+                    local_bindings,
+                    gren_syntax_node_as_ref(&case.pattern),
+                    binding_name_range,
+                ) {
+                    return Some(introduction);
+                }
+                let local_bindings_length_before_case: usize = local_bindings.len();
+                gren_syntax_pattern_bindings_for_scope_into(
+                    local_bindings,
+                    case.result.as_ref().map(gren_syntax_node_as_ref),
+                    gren_syntax_node_as_ref(&case.pattern),
+                );
+                let introduction_in_case_result: Option<GrenPatternIntroduction> = case
+                    .result
+                    .as_ref()
+                    .and_then(|case_result_node| {
+                        gren_syntax_expression_find_pattern_introduction(
+                            local_bindings,
+                            gren_syntax_node_as_ref(case_result_node),
+                            binding_name_range,
+                        )
+                    });
+                local_bindings.truncate(local_bindings_length_before_case);
+                introduction_in_case_result
+            })
+        }
+        GrenSyntaxExpression::Char(_) => None,
+        GrenSyntaxExpression::Float(_) => None,
+        GrenSyntaxExpression::IfThenElse {
+            condition: maybe_condition,
+            then_keyword_range: _,
+            on_true: maybe_on_true,
+            else_keyword_range: _,
+            on_false: maybe_on_false,
+        } => [maybe_condition, maybe_on_true, maybe_on_false]
+            .into_iter()
+            .flatten()
+            .find_map(|branch_node| {
+                gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(branch_node),
+                    binding_name_range,
+                )
+            }),
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left,
+            operator: _,
+            right: maybe_right,
+        } => {
+            if let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_unbox(left),
+                binding_name_range,
+            ) {
+                return Some(introduction);
+            }
+            match maybe_right {
+                Some(right_node) => gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(right_node),
+                    binding_name_range,
+                ),
+                None => None,
+            }
+        }
+        GrenSyntaxExpression::Integer { .. } => None,
+        GrenSyntaxExpression::Lambda {
+            parameters,
+            arrow_key_symbol_range: _,
+            result: maybe_result,
+        } => {
+            for parameter_node in parameters {
+                if let Some(introduction) = gren_syntax_pattern_root_find_pattern_introduction(
+                    GrenPatternMatched::Unknown,
+                    local_bindings,
+                    gren_syntax_node_as_ref(parameter_node),
+                    binding_name_range,
+                ) {
+                    return Some(introduction);
+                }
+                gren_syntax_pattern_bindings_for_scope_into(
+                    local_bindings,
+                    maybe_result.as_ref().map(gren_syntax_node_unbox),
+                    gren_syntax_node_as_ref(parameter_node),
+                );
+            }
+            match maybe_result {
+                Some(result_node) => gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(result_node),
+                    binding_name_range,
+                ),
+                None => None,
+            }
+        }
+        GrenSyntaxExpression::LetIn {
+            declarations,
+            in_keyword_range: _,
+            result: maybe_result,
+        } => {
+            for let_declaration_node in declarations {
+                match &let_declaration_node.value {
+                    GrenSyntaxLetDeclaration::Destructuring {
+                        pattern,
+                        equals_key_symbol_range: _,
+                        expression: maybe_expression,
+                    } => {
+                        if let Some(introduction) = gren_syntax_pattern_root_find_pattern_introduction(
+                            match maybe_expression.as_ref() {
+                                Some(expression_node) => GrenPatternMatched::Expression(
+                                    gren_syntax_node_as_ref(expression_node),
+                                ),
+                                None => GrenPatternMatched::Unknown,
+                            },
+                            local_bindings,
+                            gren_syntax_node_as_ref(pattern),
+                            binding_name_range,
+                        ) {
+                            return Some(introduction);
+                        }
+                        if let Some(expression_node) = maybe_expression
+                            && let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                                local_bindings,
+                                gren_syntax_node_as_ref(expression_node),
+                                binding_name_range,
+                            )
+                        {
+                            return Some(introduction);
+                        }
+                    }
+                    GrenSyntaxLetDeclaration::VariableDeclaration {
+                        start_name,
+                        signature,
+                        parameters,
+                        equals_key_symbol_range: _,
+                        result: maybe_declaration_result,
+                    } => {
+                        for (parameter_index, parameter_node) in parameters.iter().enumerate() {
+                            if let Some(introduction) = gren_syntax_pattern_root_find_pattern_introduction(
+                                GrenPatternMatched::DeclarationParameter {
+                                    signature: signature.as_ref(),
+                                    parameter_index,
+                                },
+                                local_bindings,
+                                gren_syntax_node_as_ref(parameter_node),
+                                binding_name_range,
+                            ) {
+                                return Some(introduction);
+                            }
+                            gren_syntax_pattern_bindings_for_scope_into(
+                                local_bindings,
+                                maybe_declaration_result
+                                    .as_ref()
+                                    .map(gren_syntax_node_as_ref),
+                                gren_syntax_node_as_ref(parameter_node),
+                            );
+                        }
+                        // a let-declared variable without a signature is typed
+                        // by its declared expression. Function-style let
+                        // declarations (with parameters) are not supported yet.
+                        if parameters.is_empty()
+                            && lsp_range_includes_position(
+                                start_name.range,
+                                binding_name_range.start,
+                            )
+                            && let Some(declaration_result_node) = maybe_declaration_result
+                        {
+                            return Some(GrenPatternIntroduction {
+                                root_pattern: None,
+                                matched: GrenPatternMatched::Expression(
+                                    gren_syntax_node_as_ref(declaration_result_node),
+                                ),
+                                local_bindings: local_bindings.clone(),
+                            });
+                        }
+                        if let Some(declaration_result_node) = maybe_declaration_result
+                            && let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                                local_bindings,
+                                gren_syntax_node_as_ref(declaration_result_node),
+                                binding_name_range,
+                            )
+                        {
+                            return Some(introduction);
+                        }
+                    }
+                }
+                gren_syntax_let_declaration_introduced_bindings_for_scope_into(
+                    local_bindings,
+                    Some(gren_syntax_expression_node),
+                    &let_declaration_node.value,
+                );
+            }
+            match maybe_result {
+                Some(result_node) => gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(result_node),
+                    binding_name_range,
+                ),
+                None => None,
+            }
+        }
+        GrenSyntaxExpression::Array(elements) => elements.iter().find_map(|element_node| {
+            gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_as_ref(element_node),
+                binding_name_range,
+            )
+        }),
+        GrenSyntaxExpression::Negation(maybe_in_negation) => match maybe_in_negation {
+            Some(in_negation_node) => gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_unbox(in_negation_node),
+                binding_name_range,
+            ),
+            None => None,
+        },
+        GrenSyntaxExpression::OperatorFunction(_) => None,
+        GrenSyntaxExpression::Parenthesized(maybe_in_parens) => match maybe_in_parens {
+            Some(in_parens_node) => gren_syntax_expression_find_pattern_introduction(
+                local_bindings,
+                gren_syntax_node_unbox(in_parens_node),
+                binding_name_range,
+            ),
+            None => None,
+        },
+        GrenSyntaxExpression::Record(fields) => fields.iter().find_map(|field| {
+            field.value.as_ref().and_then(|field_value_node| {
+                gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_as_ref(field_value_node),
+                    binding_name_range,
+                )
+            })
+        }),
+        GrenSyntaxExpression::RecordAccess {
+            record,
+            field: _,
+        } => gren_syntax_expression_find_pattern_introduction(
+            local_bindings,
+            gren_syntax_node_unbox(record),
+            binding_name_range,
+        ),
+        GrenSyntaxExpression::RecordAccessFunction(_) => None,
+        GrenSyntaxExpression::RecordUpdate {
+            record: maybe_record,
+            bar_key_symbol_range: _,
+            fields,
+        } => {
+            if let Some(record_node) = maybe_record
+                && let Some(introduction) = gren_syntax_expression_find_pattern_introduction(
+                    local_bindings,
+                    gren_syntax_node_unbox(record_node),
+                    binding_name_range,
+                )
+            {
+                return Some(introduction);
+            }
+            fields.iter().find_map(|field| {
+                field.value.as_ref().and_then(|field_value_node| {
+                    gren_syntax_expression_find_pattern_introduction(
+                        local_bindings,
+                        gren_syntax_node_as_ref(field_value_node),
+                        binding_name_range,
+                    )
+                })
+            })
+        }
+        GrenSyntaxExpression::Reference {
+            qualification: _,
+            name: _,
+        } => None,
+        GrenSyntaxExpression::String { .. } => None,
+    }
+}
+fn gren_syntax_pattern_root_find_pattern_introduction<'a>(
+    matched: GrenPatternMatched<'a>,
+    local_bindings: &GrenLocalBindings<'a>,
+    root_pattern_node: GrenSyntaxNode<&'a GrenSyntaxPattern>,
+    binding_name_range: lsp_types::Range,
+) -> Option<GrenPatternIntroduction<'a>> {
+    if lsp_range_includes_position(root_pattern_node.range, binding_name_range.start) {
+        Some(GrenPatternIntroduction {
+            root_pattern: Some(root_pattern_node),
+            matched,
+            local_bindings: local_bindings.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+struct LocalBindingTypeResolution<'a> {
+    state: &'a State,
+    project: &'a ProjectState,
+    module_syntax: &'a GrenSyntaxModule,
+    module_name: &'a str,
+    module_origin_lookup: ModuleOriginLookup<'a>,
+}
+fn local_binding_type_resolution<'a>(
+    state: &'a State,
+    project_state: &'a ProjectState,
+    module_syntax: &'a GrenSyntaxModule,
+) -> LocalBindingTypeResolution<'a> {
+    LocalBindingTypeResolution {
+        state,
+        project: project_state,
+        module_syntax,
+        module_name: module_syntax
+            .header
+            .as_ref()
+            .and_then(|header| header.module_name.as_ref())
+            .map(|node| node.value.as_ref())
+            .unwrap_or(""),
+        module_origin_lookup: gren_syntax_module_create_origin_lookup(state, project_state, module_syntax),
+    }
+}
+// a resolved type together with the module whose imports
+// decide how references inside the type resolve.
+// Types taken from another module's declarations only resolve there,
+// e.g. `RelayData` inside AppTypes' `RunningModel` is unknown to Main's imports.
+struct GrenResolvedTypeInModule {
+    type_: Box<GrenSyntaxType>,
+    origin_module: Box<str>,
+}
+impl GrenResolvedTypeInModule {
+    fn in_module(
+        type_resolution: &LocalBindingTypeResolution,
+        type_: Box<GrenSyntaxType>,
+    ) -> GrenResolvedTypeInModule {
+        GrenResolvedTypeInModule {
+            type_,
+            origin_module: Box::from(type_resolution.module_name),
+        }
+    }
+}
+// build the import lookup of the module a resolved type came from,
+// so that e.g. alias expansion resolves names in the right module
+fn local_binding_module_origin_lookup<'a>(
+    type_resolution: &LocalBindingTypeResolution<'a>,
+    origin_module: &str,
+) -> ModuleOriginLookup<'a> {
+    if origin_module == type_resolution.module_name {
+        return type_resolution.module_origin_lookup.clone();
+    }
+    match project_state_get_module_with_name(
+        type_resolution.state,
+        type_resolution.project,
+        origin_module,
+    ) {
+        Some((_, origin_module_state)) => gren_syntax_module_create_origin_lookup(
+            type_resolution.state,
+            type_resolution.project,
+            &origin_module_state.syntax,
+        ),
+        None => module_origin_lookup_for_implicit_imports(),
+    }
+}
+fn local_binding_resolved_type_markdown(
+    type_resolution: &LocalBindingTypeResolution,
+    binding_name: &str,
+    binding_name_range: lsp_types::Range,
+) -> Option<String> {
+    let resolved_type: GrenResolvedTypeInModule =
+        local_binding_resolved_type(type_resolution, binding_name_range, 0)?;
+    Some(local_binding_type_info_markdown(
+        type_resolution,
+        binding_name,
+        &resolved_type.type_,
+        &resolved_type.origin_module,
+        binding_name_range,
+    ))
+}
+fn local_binding_type_info_markdown(
+    type_resolution: &LocalBindingTypeResolution,
+    name: &str,
+    resolved_type: &GrenSyntaxType,
+    // names inside the type resolve in this module, so render with its imports
+    resolved_type_origin_module: &str,
+    name_range: lsp_types::Range,
+) -> String {
+    let resolved_type_origin_module_lookup: ModuleOriginLookup =
+        local_binding_module_origin_lookup(type_resolution, resolved_type_origin_module);
+    let type_as_string: String = gren_syntax_type_to_string(
+        &resolved_type_origin_module_lookup,
+        GrenSyntaxNode {
+            range: name_range,
+            value: resolved_type,
+        },
+        4,
+        &[],
+    );
+    format!("```gren\n{name} : {type_as_string}\n```\n")
+}
+fn local_binding_resolved_type(
+    type_resolution: &LocalBindingTypeResolution,
+    binding_name_range: lsp_types::Range,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    let introduction: GrenPatternIntroduction = gren_syntax_module_find_pattern_introduction(
+        type_resolution.module_syntax,
+        binding_name_range,
+    )?;
+    let matched_type: GrenResolvedTypeInModule = match introduction.matched {
+        GrenPatternMatched::Expression(matched_expression_node) => {
+            local_binding_expression_type(
+                type_resolution,
+                &introduction.local_bindings,
+                matched_expression_node,
+                recursion_depth + 1,
+            )?
+        }
+        GrenPatternMatched::DeclarationParameter {
+            signature: Some(signature),
+            parameter_index,
+        } => {
+            let signature_type_node: GrenSyntaxNode<&GrenSyntaxType> =
+                gren_syntax_node_as_ref(signature.type_.as_ref()?);
+            let parameter_type: Box<GrenSyntaxType> =
+                gren_syntax_type_function_parameter_at_index(signature_type_node, parameter_index)?;
+            GrenResolvedTypeInModule::in_module(type_resolution, parameter_type)
+        }
+        GrenPatternMatched::DeclarationParameter {
+            signature: None, ..
+        }
+        | GrenPatternMatched::Unknown => {
+            // no annotation to read here. The expected type from the surrounding
+            // expression can still resolve it, e.g. a lambda parameter
+            // directly used as a call argument
+            return local_binding_expected_type_at_position(
+                type_resolution,
+                binding_name_range.start,
+            );
+        }
+    };
+    match introduction.root_pattern {
+        Some(root_pattern) => local_binding_pattern_type_at_position(
+            type_resolution,
+            root_pattern,
+            binding_name_range.start,
+            matched_type,
+            recursion_depth + 1,
+        ),
+        // not introduced by a pattern, e.g. a let-declared variable:
+        // the matched expression's type already is its type
+        None => Some(matched_type),
+    }
+}
+fn local_binding_pattern_type_at_position(
+    type_resolution: &LocalBindingTypeResolution,
+    pattern_node: GrenSyntaxNode<&GrenSyntaxPattern>,
+    target_position: lsp_types::Position,
+    current_type: GrenResolvedTypeInModule,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match pattern_node.value {
+        GrenSyntaxPattern::As {
+            pattern,
+            as_keyword_range: _,
+            variable: maybe_variable,
+        } => {
+            if let Some(variable_node) = maybe_variable
+                && lsp_range_includes_position(variable_node.range, target_position)
+            {
+                return Some(current_type);
+            }
+            local_binding_pattern_type_at_position(
+                type_resolution,
+                gren_syntax_node_unbox(pattern),
+                target_position,
+                current_type,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxPattern::Char(_) => None,
+        GrenSyntaxPattern::Ignored(_) => None,
+        GrenSyntaxPattern::Int { .. } => None,
+        GrenSyntaxPattern::Parenthesized(maybe_in_parens) => match maybe_in_parens {
+            Some(in_parens) => local_binding_pattern_type_at_position(
+                type_resolution,
+                gren_syntax_node_unbox(in_parens),
+                target_position,
+                current_type,
+                recursion_depth + 1,
+            ),
+            None => None,
+        },
+        GrenSyntaxPattern::Record(fields) => fields.iter().find_map(|field| {
+            match &field.value {
+                Some(field_value_node) => {
+                    if !lsp_range_includes_position(field_value_node.range, target_position) {
+                        return None;
+                    }
+                    let field_type: GrenResolvedTypeInModule =
+                        local_binding_record_field_type(
+                            type_resolution,
+                            &current_type,
+                            field.name.value.as_ref(),
+                            recursion_depth + 1,
+                        )?;
+                    local_binding_pattern_type_at_position(
+                        type_resolution,
+                        gren_syntax_node_as_ref(field_value_node),
+                        target_position,
+                        field_type,
+                        recursion_depth + 1,
+                    )
+                }
+                None => {
+                    if field.equals_key_symbol_range.is_none()
+                        && lsp_range_includes_position(field.name.range, target_position)
+                    {
+                        local_binding_record_field_type(
+                            type_resolution,
+                            &current_type,
+                            field.name.value.as_ref(),
+                            recursion_depth + 1,
+                        )
+                    } else {
+                        None
+                    }
+                }
+            }
+        }),
+        GrenSyntaxPattern::String { .. } => None,
+        GrenSyntaxPattern::Variable(_) => {
+            if lsp_range_includes_position(pattern_node.range, target_position) {
+                Some(current_type)
+            } else {
+                None
+            }
+        }
+        GrenSyntaxPattern::Variant {
+            reference,
+            value: maybe_value,
+        } => {
+            let value_node = maybe_value.as_ref()?;
+            if !lsp_range_includes_position(value_node.range, target_position) {
+                return None;
+            }
+            let payload_type: GrenResolvedTypeInModule = local_binding_variant_payload_type(
+                type_resolution,
+                &current_type,
+                reference.value.name.as_ref(),
+                recursion_depth + 1,
+            )?;
+            local_binding_pattern_type_at_position(
+                type_resolution,
+                gren_syntax_node_unbox(value_node),
+                target_position,
+                payload_type,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxPattern::ArrayExact(elements) => {
+            let element_type: GrenResolvedTypeInModule = local_binding_array_element_type(
+                type_resolution,
+                &current_type,
+                recursion_depth + 1,
+            )?;
+            elements
+                .iter()
+                .find(|element_node| {
+                    lsp_range_includes_position(element_node.range, target_position)
+                })
+                .and_then(|element_node| {
+                    local_binding_pattern_type_at_position(
+                        type_resolution,
+                        gren_syntax_node_as_ref(element_node),
+                        target_position,
+                        element_type,
+                        recursion_depth + 1,
+                    )
+                })
+        }
+    }
+}
+// determine the type a position is expected to have from its syntactic context,
+// e.g. the field name of a record literal used as a call argument
+// (`Node.defineProgram { init = ... }` gets the matching field type of the parameter
+//  of `defineProgram`) or a lambda parameter directly used as a call argument.
+// This is a separate walk because the expected type always comes from
+// the position's surroundings, not the introduced binding itself.
+fn local_binding_expected_type_at_position(
+    type_resolution: &LocalBindingTypeResolution,
+    target_position: lsp_types::Position,
+) -> Option<GrenResolvedTypeInModule> {
+    type_resolution
+        .module_syntax
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .find_map(|documented_declaration| {
+            let declaration_node = documented_declaration.declaration.as_ref()?;
+            local_binding_declaration_expected_type_at_position(
+                type_resolution,
+                gren_syntax_node_as_ref(declaration_node),
+                target_position,
+            )
+        })
+}
+fn local_binding_declaration_expected_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    gren_syntax_declaration_node: GrenSyntaxNode<&'a GrenSyntaxDeclaration>,
+    target_position: lsp_types::Position,
+) -> Option<GrenResolvedTypeInModule> {
+    let GrenSyntaxDeclaration::Variable {
+        start_name: _,
+        signature: maybe_signature,
+        parameters,
+        equals_key_symbol_range: _,
+        result: maybe_result,
+    } = gren_syntax_declaration_node.value
+    else {
+        return None;
+    };
+    let mut local_bindings: GrenLocalBindings<'a> = Vec::new();
+    for parameter_node in parameters {
+        gren_syntax_pattern_bindings_for_scope_into(
+            &mut local_bindings,
+            maybe_result.as_ref().map(gren_syntax_node_as_ref),
+            gren_syntax_node_as_ref(parameter_node),
+        );
+    }
+    // the signature's result type is what the body is expected to have, e.g.
+    // `init : AppModel` types the fields of a record literal in the body
+    let maybe_result_expected_type: Option<GrenResolvedTypeInModule> = maybe_signature
+        .as_ref()
+        .and_then(|signature| signature.type_.as_ref())
+        .and_then(|signature_type_node| {
+            gren_syntax_type_result_after_applications(
+                gren_syntax_node_as_ref(signature_type_node),
+                parameters.len(),
+            )
+        })
+        .map(|result_type| GrenResolvedTypeInModule::in_module(type_resolution, result_type));
+    match maybe_result {
+        Some(result_node) => local_binding_expression_expected_type_at_position(
+            type_resolution,
+            &mut local_bindings,
+            gren_syntax_node_as_ref(result_node),
+            maybe_result_expected_type.as_ref(),
+            target_position,
+            0,
+        ),
+        None => None,
+    }
+}
+fn local_binding_expression_expected_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &mut GrenLocalBindings<'a>,
+    gren_syntax_expression_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    maybe_expected_type: Option<&GrenResolvedTypeInModule>,
+    target_position: lsp_types::Position,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    if !lsp_range_includes_position(gren_syntax_expression_node.range, target_position) {
+        return None;
+    }
+    match gren_syntax_expression_node.value {
+        GrenSyntaxExpression::Call {
+            called,
+            argument0,
+            argument1_up,
+        } => {
+            let found_in_arguments: Option<GrenResolvedTypeInModule> =
+                local_binding_call_argument_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(called),
+                    &std::iter::once(gren_syntax_node_unbox(argument0))
+                        .chain(argument1_up.iter().map(gren_syntax_node_as_ref))
+                        .collect::<Vec<_>>(),
+                    maybe_expected_type,
+                    target_position,
+                    recursion_depth,
+                );
+            if found_in_arguments.is_some() {
+                return found_in_arguments;
+            }
+            local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(called),
+                None,
+                target_position,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxExpression::Record(fields) => {
+            for field in fields {
+                // the field name is answered directly from the expected record type
+                if lsp_range_includes_position(field.name.range, target_position) {
+                    return match maybe_expected_type {
+                        Some(expected_type) => local_binding_record_field_type(
+                            type_resolution,
+                            expected_type,
+                            field.name.value.as_ref(),
+                            recursion_depth + 1,
+                        ),
+                        None => None,
+                    };
+                }
+                let Some(field_value_node) = &field.value else {
+                    continue;
+                };
+                if !lsp_range_includes_position(field_value_node.range, target_position) {
+                    continue;
+                }
+                let field_expected_type: Option<GrenResolvedTypeInModule> = match maybe_expected_type {
+                    Some(expected_type) => local_binding_record_field_type(
+                        type_resolution,
+                        expected_type,
+                        field.name.value.as_ref(),
+                        recursion_depth + 1,
+                    ),
+                    None => None,
+                };
+                return local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_as_ref(field_value_node),
+                    field_expected_type.as_ref(),
+                    target_position,
+                    recursion_depth + 1,
+                );
+            }
+            None
+        }
+        GrenSyntaxExpression::RecordUpdate {
+            record: maybe_record,
+            bar_key_symbol_range: _,
+            fields,
+        } => {
+            for field in fields {
+                if lsp_range_includes_position(field.name.range, target_position) {
+                    return match maybe_expected_type {
+                        Some(expected_type) => local_binding_record_field_type(
+                            type_resolution,
+                            expected_type,
+                            field.name.value.as_ref(),
+                            recursion_depth + 1,
+                        ),
+                        None => None,
+                    };
+                }
+                let Some(field_value_node) = &field.value else {
+                    continue;
+                };
+                if !lsp_range_includes_position(field_value_node.range, target_position) {
+                    continue;
+                }
+                let field_expected_type: Option<GrenResolvedTypeInModule> = match maybe_expected_type {
+                    Some(expected_type) => local_binding_record_field_type(
+                        type_resolution,
+                        expected_type,
+                        field.name.value.as_ref(),
+                        recursion_depth + 1,
+                    ),
+                    None => None,
+                };
+                return local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_as_ref(field_value_node),
+                    field_expected_type.as_ref(),
+                    target_position,
+                    recursion_depth + 1,
+                );
+            }
+            match maybe_record {
+                Some(record_node) => local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(record_node),
+                    maybe_expected_type,
+                    target_position,
+                    recursion_depth + 1,
+                ),
+                None => None,
+            }
+        }
+        GrenSyntaxExpression::Lambda {
+            parameters,
+            arrow_key_symbol_range: _,
+            result: maybe_result,
+        } => {
+            match maybe_expected_type {
+                Some(expected_type) => {
+                    for (parameter_index, parameter_node) in parameters.iter().enumerate() {
+                        if lsp_range_includes_position(parameter_node.range, target_position) {
+                            return gren_syntax_type_function_parameter_at_index(
+                                GrenSyntaxNode {
+                                    range: lsp_types::Range::default(),
+                                    value: &expected_type.type_,
+                                },
+                                parameter_index,
+                            )
+                            .map(|parameter_type| GrenResolvedTypeInModule {
+                                type_: parameter_type,
+                                origin_module: expected_type.origin_module.clone(),
+                            });
+                        }
+                    }
+                    let lambda_result_expected_type: GrenResolvedTypeInModule =
+                        gren_syntax_type_result_after_applications(
+                            GrenSyntaxNode {
+                                range: lsp_types::Range::default(),
+                                value: &expected_type.type_,
+                            },
+                            parameters.len(),
+                        )
+                        .map(|result_type| GrenResolvedTypeInModule {
+                            type_: result_type,
+                            origin_module: expected_type.origin_module.clone(),
+                        })?;
+                    match maybe_result {
+                        Some(result_node) => local_binding_expression_expected_type_at_position(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_unbox(result_node),
+                            Some(&lambda_result_expected_type),
+                            target_position,
+                            recursion_depth + 1,
+                        ),
+                        None => None,
+                    }
+                }
+                None => {
+                    for parameter_node in parameters {
+                        gren_syntax_pattern_bindings_for_scope_into(
+                            local_bindings,
+                            maybe_result.as_ref().map(gren_syntax_node_unbox),
+                            gren_syntax_node_as_ref(parameter_node),
+                        );
+                    }
+                    match maybe_result {
+                        Some(result_node) => local_binding_expression_expected_type_at_position(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_unbox(result_node),
+                            None,
+                            target_position,
+                            recursion_depth + 1,
+                        ),
+                        None => None,
+                    }
+                }
+            }
+        }
+        GrenSyntaxExpression::Parenthesized(maybe_in_parens) => match maybe_in_parens {
+            Some(in_parens_node) => local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(in_parens_node),
+                maybe_expected_type,
+                target_position,
+                recursion_depth + 1,
+            ),
+            None => None,
+        },
+        GrenSyntaxExpression::IfThenElse {
+            condition: maybe_condition,
+            then_keyword_range: _,
+            on_true: maybe_on_true,
+            else_keyword_range: _,
+            on_false: maybe_on_false,
+        } => {
+            if let Some(condition_node) = maybe_condition
+                && lsp_range_includes_position(condition_node.range, target_position)
+            {
+                return local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(condition_node),
+                    None,
+                    target_position,
+                    recursion_depth + 1,
+                );
+            }
+            [maybe_on_true, maybe_on_false]
+                .into_iter()
+                .flatten()
+                .find_map(|branch_node| {
+                    if !lsp_range_includes_position(branch_node.range, target_position) {
+                        return None;
+                    }
+                    local_binding_expression_expected_type_at_position(
+                        type_resolution,
+                        local_bindings,
+                        gren_syntax_node_unbox(branch_node),
+                        maybe_expected_type,
+                        target_position,
+                        recursion_depth + 1,
+                    )
+                })
+        }
+        GrenSyntaxExpression::WhenIs {
+            matched: maybe_matched,
+            is_keyword_range: _,
+            cases,
+        } => {
+            if let Some(matched_node) = maybe_matched
+                && lsp_range_includes_position(matched_node.range, target_position)
+            {
+                return local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(matched_node),
+                    None,
+                    target_position,
+                    recursion_depth + 1,
+                );
+            }
+            cases.iter().find_map(|case| {
+                let local_bindings_length_before_case: usize = local_bindings.len();
+                gren_syntax_pattern_bindings_for_scope_into(
+                    local_bindings,
+                    case.result.as_ref().map(gren_syntax_node_as_ref),
+                    gren_syntax_node_as_ref(&case.pattern),
+                );
+                let maybe_expected_in_case: Option<GrenResolvedTypeInModule> = case
+                    .result
+                    .as_ref()
+                    .filter(|case_result_node| {
+                        lsp_range_includes_position(case_result_node.range, target_position)
+                    })
+                    .and_then(|case_result_node| {
+                        local_binding_expression_expected_type_at_position(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_as_ref(case_result_node),
+                            maybe_expected_type,
+                            target_position,
+                            recursion_depth + 1,
+                        )
+                    });
+                local_bindings.truncate(local_bindings_length_before_case);
+                maybe_expected_in_case
+            })
+        }
+        GrenSyntaxExpression::LetIn {
+            declarations,
+            in_keyword_range: _,
+            result: maybe_result,
+        } => {
+            // calls in let declaration expressions carry their own expected types
+            for let_declaration_node in declarations {
+                let maybe_declaration_expression: Option<
+                    GrenSyntaxNode<&GrenSyntaxExpression>,
+                > = match &let_declaration_node.value {
+                    GrenSyntaxLetDeclaration::Destructuring {
+                        pattern: _,
+                        equals_key_symbol_range: _,
+                        expression: maybe_expression,
+                    } => maybe_expression.as_ref().map(gren_syntax_node_as_ref),
+                    GrenSyntaxLetDeclaration::VariableDeclaration {
+                        start_name: _,
+                        signature: _,
+                        parameters: _,
+                        equals_key_symbol_range: _,
+                        result: maybe_let_result,
+                    } => maybe_let_result.as_ref().map(gren_syntax_node_as_ref),
+                };
+                if let Some(declaration_expression_node) = maybe_declaration_expression
+                    && lsp_range_includes_position(
+                        declaration_expression_node.range,
+                        target_position,
+                    )
+                {
+                    let found_in_declaration: Option<GrenResolvedTypeInModule> =
+                        local_binding_expression_expected_type_at_position(
+                            type_resolution,
+                            local_bindings,
+                            declaration_expression_node,
+                            None,
+                            target_position,
+                            recursion_depth + 1,
+                        );
+                    if found_in_declaration.is_some() {
+                        return found_in_declaration;
+                    }
+                }
+                gren_syntax_let_declaration_introduced_bindings_for_scope_into(
+                    local_bindings,
+                    Some(gren_syntax_expression_node),
+                    &let_declaration_node.value,
+                );
+            }
+            match maybe_result {
+                Some(result_node) => local_binding_expression_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(result_node),
+                    maybe_expected_type,
+                    target_position,
+                    recursion_depth + 1,
+                ),
+                None => None,
+            }
+        }
+        GrenSyntaxExpression::Array(elements) => {
+            let element_expected_type: Option<GrenResolvedTypeInModule> =
+                match maybe_expected_type {
+                    Some(expected_type) => local_binding_array_element_type(
+                        type_resolution,
+                        expected_type,
+                        recursion_depth + 1,
+                    ),
+                    None => None,
+                };
+            elements
+                .iter()
+                .filter(|element_node| {
+                    lsp_range_includes_position(element_node.range, target_position)
+                })
+                .find_map(|element_node| {
+                    local_binding_expression_expected_type_at_position(
+                        type_resolution,
+                        local_bindings,
+                        gren_syntax_node_as_ref(element_node),
+                        element_expected_type.as_ref(),
+                        target_position,
+                        recursion_depth + 1,
+                    )
+                })
+        }
+        GrenSyntaxExpression::Negation(maybe_in_negation) => match maybe_in_negation {
+            Some(in_negation_node) => local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(in_negation_node),
+                maybe_expected_type,
+                target_position,
+                recursion_depth + 1,
+            ),
+            None => None,
+        },
+        GrenSyntaxExpression::RecordAccess {
+            record,
+            field: _,
+        } => local_binding_expression_expected_type_at_position(
+            type_resolution,
+            local_bindings,
+            gren_syntax_node_unbox(record),
+            None,
+            target_position,
+            recursion_depth + 1,
+        ),
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left,
+            operator,
+            right,
+        } => {
+            // `value |> function argument1 ...` behaves like `function argument1 ... value`:
+            // walk the right side as a call with the piped value as a final argument
+            if operator.value == "|>"
+                && let Some(right_node) = right
+            {
+                let right_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+                    match right_node.value.as_ref() {
+                        GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                            gren_syntax_node_unbox(in_parens_node)
+                        }
+                        _ => gren_syntax_node_unbox(right_node),
+                    };
+                if let GrenSyntaxExpression::Call {
+                    called: right_called,
+                    argument0: right_argument0,
+                    argument1_up: right_argument1_up,
+                } = right_unparenthesized.value
+                {
+                    let found_in_piped_call: Option<GrenResolvedTypeInModule> =
+                        local_binding_call_argument_expected_type_at_position(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_unbox(right_called),
+                            &std::iter::once(gren_syntax_node_unbox(right_argument0))
+                                .chain(right_argument1_up.iter().map(gren_syntax_node_as_ref))
+                                .chain(std::iter::once(gren_syntax_node_unbox(left)))
+                                .collect::<Vec<_>>(),
+                            maybe_expected_type,
+                            target_position,
+                            recursion_depth,
+                        );
+                    if found_in_piped_call.is_some() {
+                        return found_in_piped_call;
+                    }
+                }
+            } else if let Some(right_node) = right {
+                // e.g. `left ++ right`: the right operand is expected to
+                // have the left operand's type
+                let left_value_type: Option<GrenResolvedTypeInModule> =
+                    local_binding_expression_type(
+                        type_resolution,
+                        local_bindings,
+                        gren_syntax_node_unbox(left),
+                        recursion_depth + 1,
+                    );
+                let found_in_right: Option<GrenResolvedTypeInModule> =
+                    local_binding_expression_expected_type_at_position(
+                        type_resolution,
+                        local_bindings,
+                        gren_syntax_node_unbox(right_node),
+                        left_value_type.as_ref(),
+                        target_position,
+                        recursion_depth + 1,
+                    );
+                if found_in_right.is_some() {
+                    return found_in_right;
+                }
+            }
+            local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(left),
+                None,
+                target_position,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxExpression::Char(_)
+        | GrenSyntaxExpression::Float(_)
+        | GrenSyntaxExpression::Integer { .. }
+        | GrenSyntaxExpression::OperatorFunction(_)
+        | GrenSyntaxExpression::RecordAccessFunction(_)
+        | GrenSyntaxExpression::Reference {
+            qualification: _,
+            name: _,
+        }
+        | GrenSyntaxExpression::String { .. } => None,
+    }
+}
+
+// answer the expected type at target_position for one argument
+// of `called argument0 argument1 ...`. Type variables in the argument's
+// parameter type are resolved from the surrounding expected type and
+// the other arguments' value types, e.g. `a` and `b` in
+// `Array.foldl : (a -> b -> b) -> b -> Array a -> b`
+fn local_binding_call_argument_expected_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &mut GrenLocalBindings<'a>,
+    called_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    argument_nodes: &[GrenSyntaxNode<&'a GrenSyntaxExpression>],
+    maybe_call_expected_type: Option<&GrenResolvedTypeInModule>,
+    target_position: lsp_types::Position,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    let (argument_index, argument_node): (usize, GrenSyntaxNode<&GrenSyntaxExpression>) =
+        argument_nodes
+            .iter()
+            .enumerate()
+            .find_map(|(argument_index, argument_node)| {
+                lsp_range_includes_position(argument_node.range, target_position)
+                    .then_some((argument_index, *argument_node))
+            })?;
+    let called_type: GrenResolvedTypeInModule = local_binding_expression_type(
+        type_resolution,
+        local_bindings,
+        called_node,
+        recursion_depth + 1,
+    )?;
+    let called_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+        range: lsp_types::Range::default(),
+        value: &called_type.type_,
+    };
+    // parameter types come from the called declaration's module
+    let argument_parameter_type: Box<GrenSyntaxType> =
+        gren_syntax_type_function_parameter_at_index(called_type_node, argument_index)?;
+    let refined_argument_expected_type: Box<GrenSyntaxType> =
+        local_binding_refine_type_variables_in_argument_type(
+            type_resolution,
+            local_bindings,
+            called_type_node,
+            argument_nodes,
+            argument_index,
+            &argument_parameter_type,
+            maybe_call_expected_type,
+            recursion_depth,
+        );
+    local_binding_expression_expected_type_at_position(
+        type_resolution,
+        local_bindings,
+        argument_node,
+        Some(&GrenResolvedTypeInModule {
+            type_: refined_argument_expected_type,
+            origin_module: called_type.origin_module,
+        }),
+        target_position,
+        recursion_depth + 1,
+    )
+}
+
+// resolve type variables in a call argument's parameter type by binding them
+// to matching parts of the types known from the call's context.
+// The first binding wins, so the most authoritative source is unified first:
+// the expected result type (e.g. the declaration signature's result type),
+// then the other arguments' value types.
+// boxes keep every resolved type uniformly owned, so that
+// cloning resolved types stays cheap and recursive construction is possible
+#[allow(clippy::unnecessary_box_returns)]
+fn local_binding_refine_type_variables_in_argument_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    called_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    argument_nodes: &[GrenSyntaxNode<&GrenSyntaxExpression>],
+    target_argument_index: usize,
+    argument_parameter_type: &GrenSyntaxType,
+    maybe_call_expected_type: Option<&GrenResolvedTypeInModule>,
+    recursion_depth: u8,
+) -> Box<GrenSyntaxType> {
+    let argument_parameter_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+        range: lsp_types::Range::default(),
+        value: argument_parameter_type,
+    };
+    if !gren_syntax_type_has_variable(argument_parameter_type_node, 0) {
+        return Box::from(argument_parameter_type.clone());
+    }
+    let mut type_substitutions: GrenTypeSubstitutions = Vec::new();
+    if let Some(call_expected_type) = maybe_call_expected_type
+        && let Some(result_type) =
+            gren_syntax_type_result_after_applications(called_type_node, argument_nodes.len())
+    {
+        local_binding_unify_types_into(
+            &mut type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &result_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &call_expected_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+    for (sibling_index, sibling_node) in argument_nodes.iter().enumerate() {
+        if sibling_index == target_argument_index {
+            continue;
+        }
+        let Some(sibling_parameter_type) =
+            gren_syntax_type_function_parameter_at_index(called_type_node, sibling_index)
+        else {
+            continue;
+        };
+        let Some(sibling_value_type) = local_binding_expression_type(
+            type_resolution,
+            local_bindings,
+            *sibling_node,
+            recursion_depth + 1,
+        ) else {
+            continue;
+        };
+        local_binding_unify_types_into(
+            &mut type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &sibling_parameter_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &sibling_value_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+    if type_substitutions.is_empty() {
+        return Box::from(argument_parameter_type.clone());
+    }
+    gren_syntax_type_substitute(argument_parameter_type_node, &type_substitutions, 0)
+}
+
+fn gren_syntax_type_has_variable(
+    gren_syntax_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    recursion_depth: u8,
+) -> bool {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return false;
+    }
+    match gren_syntax_type_node.value {
+        GrenSyntaxType::Variable(_) => true,
+        GrenSyntaxType::Function {
+            input,
+            arrow_key_symbol_range: _,
+            output,
+        } => {
+            gren_syntax_type_has_variable(gren_syntax_node_unbox(input), recursion_depth + 1)
+                || output
+                    .as_ref()
+                    .is_some_and(|output_node| {
+                        gren_syntax_type_has_variable(
+                            gren_syntax_node_unbox(output_node),
+                            recursion_depth + 1,
+                        )
+                    })
+        }
+        GrenSyntaxType::Construct {
+            reference: _,
+            arguments,
+        } => arguments.iter().any(|argument_node| {
+            gren_syntax_type_has_variable(gren_syntax_node_as_ref(argument_node), recursion_depth + 1)
+        }),
+        GrenSyntaxType::Parenthesized(maybe_in_parens) => maybe_in_parens
+            .as_ref()
+            .is_some_and(|in_parens_node| {
+                gren_syntax_type_has_variable(gren_syntax_node_unbox(in_parens_node), recursion_depth + 1)
+            }),
+        GrenSyntaxType::Record(fields) | GrenSyntaxType::RecordExtension {
+            record_variable: _,
+            bar_key_symbol_range: _,
+            fields,
+        } => fields.iter().any(|field| {
+            field
+                .value
+                .as_ref()
+                .is_some_and(|field_value_node| {
+                    gren_syntax_type_has_variable(
+                        gren_syntax_node_as_ref(field_value_node),
+                        recursion_depth + 1,
+                    )
+                })
+        }),
+    }
+}
+
+// bind type variables in the parameter type to matching parts of the actual type,
+// e.g. `a` in `Array a` to `Effect Msg` when unified with `Array (Effect Msg)`.
+// Unification is shallow: it only descends where both types agree structurally.
+fn local_binding_unify_types_into(
+    type_substitutions: &mut GrenTypeSubstitutions,
+    parameter_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    actual_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    recursion_depth: u8,
+) {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return;
+    }
+    // parenthesization carries no meaning for unification
+    let parameter_unparenthesized: GrenSyntaxNode<&GrenSyntaxType> =
+        gren_syntax_type_to_unparenthesized(parameter_type_node).unwrap_or(parameter_type_node);
+    let actual_unparenthesized: GrenSyntaxNode<&GrenSyntaxType> =
+        gren_syntax_type_to_unparenthesized(actual_type_node).unwrap_or(actual_type_node);
+    match parameter_unparenthesized.value {
+        GrenSyntaxType::Variable(parameter_variable_name) => {
+            let already_bound: bool = type_substitutions
+                .iter()
+                .any(|(substituted_name, _)| {
+                    substituted_name.as_ref() == parameter_variable_name.as_ref()
+                });
+            if !already_bound {
+                type_substitutions.push((
+                    parameter_variable_name.clone(),
+                    Box::from(actual_type_node.value.clone()),
+                ));
+            }
+        }
+        GrenSyntaxType::Function {
+            input,
+            arrow_key_symbol_range: _,
+            output,
+        } => {
+            if let GrenSyntaxType::Function {
+                input: actual_input,
+                arrow_key_symbol_range: _,
+                output: actual_output,
+            } = actual_unparenthesized.value
+            {
+                local_binding_unify_types_into(
+                    type_substitutions,
+                    gren_syntax_node_unbox(input),
+                    gren_syntax_node_unbox(actual_input),
+                    recursion_depth + 1,
+                );
+                if let (Some(output_node), Some(actual_output_node)) =
+                    (output.as_ref(), actual_output.as_ref())
+                {
+                    local_binding_unify_types_into(
+                        type_substitutions,
+                        gren_syntax_node_unbox(output_node),
+                        gren_syntax_node_unbox(actual_output_node),
+                        recursion_depth + 1,
+                    );
+                }
+            }
+        }
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } => {
+            if let GrenSyntaxType::Construct {
+                reference: actual_reference,
+                arguments: actual_arguments,
+            } = actual_unparenthesized.value
+                && actual_reference.value.name == reference.value.name
+                && actual_arguments.len() == arguments.len()
+            {
+                for (argument_node, actual_argument_node) in
+                    arguments.iter().zip(actual_arguments.iter())
+                {
+                    local_binding_unify_types_into(
+                        type_substitutions,
+                        gren_syntax_node_as_ref(argument_node),
+                        gren_syntax_node_as_ref(actual_argument_node),
+                        recursion_depth + 1,
+                    );
+                }
+            }
+        }
+        GrenSyntaxType::Parenthesized(maybe_in_parens) => {
+            if let Some(in_parens_node) = maybe_in_parens {
+                local_binding_unify_types_into(
+                    type_substitutions,
+                    gren_syntax_node_unbox(in_parens_node),
+                    actual_unparenthesized,
+                    recursion_depth + 1,
+                );
+            }
+        }
+        GrenSyntaxType::Record(fields) => {
+            if let GrenSyntaxType::Record(actual_fields) = actual_unparenthesized.value {
+                for field in fields {
+                    let Some(field_value_node) = field.value.as_ref() else {
+                        continue;
+                    };
+                    let Some(actual_field) = actual_fields
+                        .iter()
+                        .find(|actual_field| actual_field.name.value == field.name.value)
+                    else {
+                        continue;
+                    };
+                    let Some(actual_field_value_node) = actual_field.value.as_ref() else {
+                        continue;
+                    };
+                    local_binding_unify_types_into(
+                        type_substitutions,
+                        gren_syntax_node_as_ref(field_value_node),
+                        gren_syntax_node_as_ref(actual_field_value_node),
+                        recursion_depth + 1,
+                    );
+                }
+            }
+        }
+        GrenSyntaxType::RecordExtension { .. } => {}
+    }
+}
+
+fn local_binding_expression_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    expression_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match expression_node.value {
+        GrenSyntaxExpression::Call {
+            called,
+            argument0: _,
+            argument1_up,
+        } => {
+            let called_type: GrenResolvedTypeInModule = local_binding_expression_type(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(called),
+                recursion_depth + 1,
+            )?;
+            gren_syntax_type_result_after_applications(
+                GrenSyntaxNode {
+                    range: lsp_types::Range::default(),
+                    value: &called_type.type_,
+                },
+                1 + argument1_up.len(),
+            )
+            .map(|result_type| GrenResolvedTypeInModule {
+                type_: result_type,
+                origin_module: called_type.origin_module.clone(),
+            })
+        }
+        GrenSyntaxExpression::WhenIs {
+            matched: _,
+            is_keyword_range: _,
+            cases,
+        } => cases
+            .first()
+            .and_then(|case| case.result.as_ref())
+            .and_then(|case_result_node| {
+                local_binding_expression_type(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_as_ref(case_result_node),
+                    recursion_depth + 1,
+                )
+            }),
+        GrenSyntaxExpression::Char(_) => Some(GrenResolvedTypeInModule::in_module(
+            type_resolution,
+            local_binding_constructed_type("Char", vec![]),
+        )),
+        GrenSyntaxExpression::Float(_) => Some(GrenResolvedTypeInModule::in_module(
+            type_resolution,
+            local_binding_constructed_type("Float", vec![]),
+        )),
+        GrenSyntaxExpression::IfThenElse {
+            condition: _,
+            then_keyword_range: _,
+            on_true: maybe_on_true,
+            else_keyword_range: _,
+            on_false: _,
+        } => maybe_on_true
+            .as_ref()
+            .and_then(|on_true_node| {
+                local_binding_expression_type(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(on_true_node),
+                    recursion_depth + 1,
+                )
+            }),
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left: _,
+            operator,
+            right: _,
+        } => {
+            let operator_function_type: GrenResolvedTypeInModule =
+                local_binding_operator_function_type(type_resolution, operator.value)?;
+            gren_syntax_type_result_after_applications(
+                GrenSyntaxNode {
+                    range: lsp_types::Range::default(),
+                    value: &operator_function_type.type_,
+                },
+                2,
+            )
+            .map(|result_type| GrenResolvedTypeInModule {
+                type_: result_type,
+                origin_module: operator_function_type.origin_module.clone(),
+            })
+        }
+        GrenSyntaxExpression::Integer { .. } => Some(GrenResolvedTypeInModule::in_module(
+            type_resolution,
+            local_binding_constructed_type("Int", vec![]),
+        )),
+        GrenSyntaxExpression::Lambda {
+            parameters: _,
+            arrow_key_symbol_range: _,
+            result: _,
+        } => None,
+        GrenSyntaxExpression::LetIn {
+            declarations,
+            in_keyword_range: _,
+            result: maybe_result,
+        } => {
+            let mut let_local_bindings: GrenLocalBindings = local_bindings.clone();
+            for let_declaration_node in declarations {
+                gren_syntax_let_declaration_introduced_bindings_for_scope_into(
+                    &mut let_local_bindings,
+                    Some(expression_node),
+                    &let_declaration_node.value,
+                );
+            }
+            maybe_result
+                .as_ref()
+                .and_then(|result_node| {
+                    local_binding_expression_type(
+                        type_resolution,
+                        &let_local_bindings,
+                        gren_syntax_node_unbox(result_node),
+                        recursion_depth + 1,
+                    )
+                })
+        }
+        GrenSyntaxExpression::Array(elements) => {
+            let element_type: GrenResolvedTypeInModule = elements
+                .first()
+                .and_then(|element_node| {
+                    local_binding_expression_type(
+                        type_resolution,
+                        local_bindings,
+                        gren_syntax_node_as_ref(element_node),
+                        recursion_depth + 1,
+                    )
+                })?;
+            Some(GrenResolvedTypeInModule {
+                type_: local_binding_constructed_type("Array", vec![element_type.type_]),
+                origin_module: Box::from(type_resolution.module_name),
+            })
+        }
+        GrenSyntaxExpression::Negation(maybe_in_negation) => maybe_in_negation
+            .as_ref()
+            .and_then(|in_negation_node| {
+                local_binding_expression_type(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(in_negation_node),
+                    recursion_depth + 1,
+                )
+            }),
+        GrenSyntaxExpression::OperatorFunction(operator_node) => {
+            local_binding_operator_function_type(type_resolution, operator_node.value)
+        }
+        GrenSyntaxExpression::Parenthesized(maybe_in_parens) => maybe_in_parens
+            .as_ref()
+            .and_then(|in_parens_node| {
+                local_binding_expression_type(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(in_parens_node),
+                    recursion_depth + 1,
+                )
+            }),
+        GrenSyntaxExpression::Record(fields) => {
+            let mut resolved_fields: Vec<GrenSyntaxTypeField> = Vec::with_capacity(fields.len());
+            let mut any_field_resolved: bool = false;
+            for field in fields {
+                let maybe_field_type: Option<GrenResolvedTypeInModule> =
+                    match &field.value {
+                        Some(field_value_node) => local_binding_expression_type(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_as_ref(field_value_node),
+                            recursion_depth + 1,
+                        ),
+                        None => {
+                            if field.equals_key_symbol_range.is_some() {
+                                None
+                            } else {
+                                // punned record field: `{ name }` uses the local binding `name`
+                                find_local_binding_scope_expression(
+                                    local_bindings,
+                                    field.name.value.as_ref(),
+                                )
+                                .and_then(|(local_binding_origin, _)| {
+                                    local_binding_local_origin_type(
+                                        type_resolution,
+                                        local_binding_origin,
+                                        recursion_depth + 1,
+                                    )
+                                })
+                            }
+                        }
+                    };
+                any_field_resolved |= maybe_field_type.is_some();
+                resolved_fields.push(GrenSyntaxTypeField {
+                    name: field.name.clone(),
+                    colon_key_symbol_range: None,
+                    value: maybe_field_type.map(|field_type| GrenSyntaxNode {
+                        range: lsp_types::Range::default(),
+                        value: *field_type.type_,
+                    }),
+                });
+            }
+            if any_field_resolved {
+                Some(GrenResolvedTypeInModule::in_module(
+                    type_resolution,
+                    Box::from(GrenSyntaxType::Record(resolved_fields)),
+                ))
+            } else {
+                None
+            }
+        }
+        GrenSyntaxExpression::RecordAccess {
+            record,
+            field: maybe_field,
+        } => {
+            let record_type: GrenResolvedTypeInModule = local_binding_expression_type(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(record),
+                recursion_depth + 1,
+            )?;
+            let field_node = maybe_field.as_ref()?;
+            local_binding_record_field_type(
+                type_resolution,
+                &record_type,
+                field_node.value.as_ref(),
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxExpression::RecordAccessFunction(_) => None,
+        GrenSyntaxExpression::RecordUpdate {
+            record: maybe_record,
+            bar_key_symbol_range: _,
+            fields: _,
+        } => maybe_record
+            .as_ref()
+            .and_then(|record_node| {
+                local_binding_expression_type(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(record_node),
+                    recursion_depth + 1,
+                )
+            }),
+        GrenSyntaxExpression::Reference {
+            qualification,
+            name,
+        } => local_binding_reference_type(
+            type_resolution,
+            local_bindings,
+            qualification,
+            name,
+            recursion_depth + 1,
+        ),
+        GrenSyntaxExpression::String { .. } => {
+            Some(GrenResolvedTypeInModule::in_module(
+                type_resolution,
+                local_binding_constructed_type("String", vec![]),
+            ))
+        }
+    }
+}
+fn local_binding_reference_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    qualification: &str,
+    name: &str,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if qualification.is_empty()
+        && let Some((local_binding_origin, _)) =
+            find_local_binding_scope_expression(local_bindings, name)
+    {
+        // a local binding shadows module members, even when its type is unknown
+        return local_binding_local_origin_type(type_resolution, local_binding_origin, recursion_depth);
+    }
+    let module_origin: &str = look_up_origin_module(
+        &type_resolution.module_origin_lookup,
+        GrenQualified {
+            qualification,
+            name,
+        },
+    );
+    let (_, origin_module_state) = project_state_get_module_with_name(
+        type_resolution.state,
+        type_resolution.project,
+        module_origin,
+    )?;
+    origin_module_state
+        .syntax
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .filter_map(|documented_declaration| documented_declaration.declaration.as_ref())
+        .find_map(|declaration_node| match &declaration_node.value {
+            // a custom type variant (constructor), e.g. `Nothing`, `False`
+            // or `RegisterDioInput { ... }`. Without a payload it has the
+            // constructed type itself, with one the matching function type.
+            GrenSyntaxDeclaration::ChoiceType {
+                name: maybe_choice_type_name,
+                parameters,
+                equals_key_symbol_range: _,
+                variant0_name,
+                variant0_value,
+                variant1_up,
+            } => {
+                let choice_type_name_node = maybe_choice_type_name.as_ref()?;
+                let maybe_variant_payload_type_node: Option<&GrenSyntaxNode<GrenSyntaxType>> =
+                    if variant0_name
+                        .as_ref()
+                        .is_some_and(|variant_name_node| variant_name_node.value.as_ref() == name)
+                    {
+                        variant0_value.as_ref()
+                    } else {
+                        match variant1_up.iter().find(|variant| {
+                            variant
+                                .name
+                                .as_ref()
+                                .is_some_and(|variant_name_node| {
+                                    variant_name_node.value.as_ref() == name
+                                })
+                        }) {
+                            Some(variant) => variant.value.as_ref(),
+                            // the reference is not a variant of this choice type
+                            None => return None,
+                        }
+                    };
+                let constructed_type: Box<GrenSyntaxType> = local_binding_constructed_type(
+                    choice_type_name_node.value.as_ref(),
+                    parameters
+                        .iter()
+                        .map(|parameter_node| {
+                            Box::from(GrenSyntaxType::Variable(parameter_node.value.clone()))
+                        })
+                        .collect(),
+                );
+                let reference_type: Box<GrenSyntaxType> = match maybe_variant_payload_type_node {
+                    Some(variant_payload_type_node) => Box::from(GrenSyntaxType::Function {
+                        input: GrenSyntaxNode {
+                            range: variant_payload_type_node.range,
+                            value: Box::from(variant_payload_type_node.value.clone()),
+                        },
+                        arrow_key_symbol_range: lsp_types::Range::default(),
+                        output: Some(GrenSyntaxNode {
+                            range: lsp_types::Range::default(),
+                            value: constructed_type,
+                        }),
+                    }),
+                    None => constructed_type,
+                };
+                Some(GrenResolvedTypeInModule {
+                    type_: reference_type,
+                    origin_module: Box::from(module_origin),
+                })
+            }
+            GrenSyntaxDeclaration::Variable {
+                start_name,
+                signature: Some(signature),
+                ..
+            } if start_name.value.as_ref() == name => signature
+                .type_
+                .as_ref()
+                .map(|signature_type_node| GrenResolvedTypeInModule {
+                    type_: Box::from(signature_type_node.value.clone()),
+                    // the signature's references resolve in its own module
+                    origin_module: Box::from(module_origin),
+                }),
+            GrenSyntaxDeclaration::Port {
+                name: maybe_name,
+                colon_key_symbol_range: _,
+                type_: maybe_type,
+            } if maybe_name
+                .as_ref()
+                .is_some_and(|port_name_node| port_name_node.value.as_ref() == name) =>
+            {
+                maybe_type.as_ref().map(|port_type_node| GrenResolvedTypeInModule {
+                    type_: Box::from(port_type_node.value.clone()),
+                    origin_module: Box::from(module_origin),
+                })
+            }
+            _ => None,
+        })
+}
+fn local_binding_local_origin_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_binding_origin: LocalBindingOrigin,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    match local_binding_origin {
+        LocalBindingOrigin::LetDeclaredVariable {
+            signature: maybe_signature,
+            start_name_range,
+        } => maybe_signature
+            .and_then(|signature| signature.type_.as_ref())
+            .map(|signature_type_node| GrenResolvedTypeInModule::in_module(
+                type_resolution,
+                Box::from(signature_type_node.value.clone()),
+            ))
+            .or_else(|| {
+                // no signature to read: the let declaration's expression decides the type
+                local_binding_resolved_type(type_resolution, start_name_range, recursion_depth + 1)
+            }),
+        LocalBindingOrigin::PatternVariable(name_range)
+        | LocalBindingOrigin::PatternRecordField(name_range) => {
+            local_binding_resolved_type(type_resolution, name_range, recursion_depth + 1)
+        }
+    }
+}
+fn local_binding_record_field_type(
+    type_resolution: &LocalBindingTypeResolution,
+    record_type: &GrenResolvedTypeInModule,
+    field_name: &str,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match &*record_type.type_ {
+        GrenSyntaxType::Record(fields) => fields
+            .iter()
+            .find(|field| field.name.value.as_ref() == field_name)
+            .and_then(|field| {
+                field
+                    .value
+                    .as_ref()
+                    .map(|field_type_node| GrenResolvedTypeInModule {
+                        type_: Box::from(field_type_node.value.clone()),
+                        origin_module: record_type.origin_module.clone(),
+                    })
+            }),
+        GrenSyntaxType::RecordExtension {
+            record_variable: _,
+            bar_key_symbol_range: _,
+            fields,
+        } => fields
+            .iter()
+            .find(|field| field.name.value.as_ref() == field_name)
+            .and_then(|field| {
+                field
+                    .value
+                    .as_ref()
+                    .map(|field_type_node| GrenResolvedTypeInModule {
+                        type_: Box::from(field_type_node.value.clone()),
+                        origin_module: record_type.origin_module.clone(),
+                    })
+            }),
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } => {
+            // expand a type alias to a record, resolving the alias name
+            // in the module the record type came from
+            let (expanded_type, alias_origin_module): (Box<GrenSyntaxType>, Box<str>) =
+                local_binding_alias_expanded_type(
+                    type_resolution,
+                    &record_type.origin_module,
+                    &reference.value,
+                    arguments,
+                )?;
+            local_binding_record_field_type(
+                type_resolution,
+                &GrenResolvedTypeInModule {
+                    type_: expanded_type,
+                    origin_module: alias_origin_module,
+                },
+                field_name,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxType::Parenthesized(Some(in_parens)) => local_binding_record_field_type(
+            type_resolution,
+            &GrenResolvedTypeInModule {
+                type_: in_parens.value.clone(),
+                origin_module: record_type.origin_module.clone(),
+            },
+            field_name,
+            recursion_depth + 1,
+        ),
+        GrenSyntaxType::Function { .. } | GrenSyntaxType::Parenthesized(None) => None,
+        GrenSyntaxType::Variable(_) => None,
+    }
+}
+fn local_binding_variant_payload_type(
+    type_resolution: &LocalBindingTypeResolution,
+    matched_type: &GrenResolvedTypeInModule,
+    variant_name: &str,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match &*matched_type.type_ {
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } => {
+            let (choice_type_origin_module, declaration_node) =
+                local_binding_find_declaration_with_name(
+                    type_resolution,
+                    &matched_type.origin_module,
+                    &reference.value,
+                    reference.value.name.as_ref(),
+                )?;
+            let GrenSyntaxDeclaration::ChoiceType {
+                name: _,
+                parameters,
+                equals_key_symbol_range: _,
+                variant0_name: maybe_variant0_name,
+                variant0_value: maybe_variant0_value,
+                variant1_up,
+            } = &declaration_node.value
+            else {
+                return None;
+            };
+            let variant_payload_type_node: &GrenSyntaxNode<GrenSyntaxType> = if maybe_variant0_name
+                .as_ref()
+                .is_some_and(|variant0_name_node| variant0_name_node.value.as_ref() == variant_name)
+            {
+                maybe_variant0_value.as_ref()?
+            } else {
+                variant1_up
+                    .iter()
+                    .find(|variant| {
+                        variant
+                            .name
+                            .as_ref()
+                            .is_some_and(|variant_name_node| {
+                                variant_name_node.value.as_ref() == variant_name
+                            })
+                    })
+                    .and_then(|variant| variant.value.as_ref())?
+            };
+            let type_substitutions: GrenTypeSubstitutions =
+                local_binding_substitutions_for_parameters(parameters, arguments);
+            Some(GrenResolvedTypeInModule {
+                type_: gren_syntax_type_substitute(
+                    gren_syntax_node_as_ref(variant_payload_type_node),
+                    &type_substitutions,
+                    recursion_depth + 1,
+                ),
+                origin_module: choice_type_origin_module,
+            })
+        }
+        GrenSyntaxType::Parenthesized(Some(in_parens)) => local_binding_variant_payload_type(
+            type_resolution,
+            &GrenResolvedTypeInModule {
+                type_: in_parens.value.clone(),
+                origin_module: matched_type.origin_module.clone(),
+            },
+            variant_name,
+            recursion_depth + 1,
+        ),
+        GrenSyntaxType::Function { .. }
+        | GrenSyntaxType::Parenthesized(None)
+        | GrenSyntaxType::Record(_)
+        | GrenSyntaxType::RecordExtension { .. }
+        | GrenSyntaxType::Variable(_) => None,
+    }
+}
+fn local_binding_array_element_type(
+    type_resolution: &LocalBindingTypeResolution,
+    matched_type: &GrenResolvedTypeInModule,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match &*matched_type.type_ {
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } if reference.value.name.as_ref() == "Array" && arguments.len() == 1 => {
+            Some(GrenResolvedTypeInModule {
+                type_: Box::from(arguments[0].value.clone()),
+                origin_module: matched_type.origin_module.clone(),
+            })
+        }
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } => {
+            // expand a type alias to an array
+            let (expanded_type, alias_origin_module): (Box<GrenSyntaxType>, Box<str>) =
+                local_binding_alias_expanded_type(
+                    type_resolution,
+                    &matched_type.origin_module,
+                    &reference.value,
+                    arguments,
+                )?;
+            local_binding_array_element_type(
+                type_resolution,
+                &GrenResolvedTypeInModule {
+                    type_: expanded_type,
+                    origin_module: alias_origin_module,
+                },
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxType::Parenthesized(Some(in_parens)) => local_binding_array_element_type(
+            type_resolution,
+            &GrenResolvedTypeInModule {
+                type_: in_parens.value.clone(),
+                origin_module: matched_type.origin_module.clone(),
+            },
+            recursion_depth + 1,
+        ),
+        GrenSyntaxType::Function { .. }
+        | GrenSyntaxType::Parenthesized(None)
+        | GrenSyntaxType::Record(_)
+        | GrenSyntaxType::RecordExtension { .. }
+        | GrenSyntaxType::Variable(_) => None,
+    }
+}
+fn local_binding_alias_expanded_type(
+    type_resolution: &LocalBindingTypeResolution,
+    type_origin_module: &str,
+    alias_reference: &GrenQualifiedName,
+    alias_arguments: &[GrenSyntaxNode<GrenSyntaxType>],
+) -> Option<(Box<GrenSyntaxType>, Box<str>)> {
+    let (alias_origin_module, declaration_node) = local_binding_find_declaration_with_name(
+        type_resolution,
+        type_origin_module,
+        alias_reference,
+        alias_reference.name.as_ref(),
+    )?;
+    let GrenSyntaxDeclaration::TypeAlias {
+        alias_keyword_range: _,
+        name: _,
+        parameters,
+        equals_key_symbol_range: _,
+        type_: maybe_aliased_type,
+    } = &declaration_node.value
+    else {
+        return None;
+    };
+    let aliased_type_node = maybe_aliased_type.as_ref()?;
+    let type_substitutions: GrenTypeSubstitutions =
+        local_binding_substitutions_for_parameters(parameters, alias_arguments);
+    Some((
+        gren_syntax_type_substitute(
+            gren_syntax_node_as_ref(aliased_type_node),
+            &type_substitutions,
+            0,
+        ),
+        alias_origin_module,
+    ))
+}
+fn local_binding_find_declaration_with_name<'a>(
+    type_resolution: &LocalBindingTypeResolution<'a>,
+    type_origin_module: &str,
+    qualified_name: &GrenQualifiedName,
+    declaration_name: &str,
+) -> Option<(Box<str>, GrenSyntaxNode<&'a GrenSyntaxDeclaration>)> {
+    // resolve the qualified name in the module the surrounding type came from,
+    // not necessarily the hovered module
+    let type_origin_module_lookup: ModuleOriginLookup<'a> =
+        local_binding_module_origin_lookup(type_resolution, type_origin_module);
+    let module_origin: &str = look_up_origin_module(
+        &type_origin_module_lookup,
+        GrenQualified {
+            qualification: qualified_name.qualification.as_ref(),
+            name: qualified_name.name.as_ref(),
+        },
+    );
+    let (_, origin_module_state) = project_state_get_module_with_name(
+        type_resolution.state,
+        type_resolution.project,
+        module_origin,
+    )?;
+    origin_module_state
+        .syntax
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .filter_map(|documented_declaration| documented_declaration.declaration.as_ref())
+        .find(|declaration_node| match &declaration_node.value {
+            GrenSyntaxDeclaration::ChoiceType {
+                name: maybe_name, ..
+            }
+            | GrenSyntaxDeclaration::TypeAlias {
+                name: maybe_name, ..
+            }
+            | GrenSyntaxDeclaration::Port {
+                name: maybe_name, ..
+            } => maybe_name
+                .as_ref()
+                .is_some_and(|name_node| name_node.value.as_ref() == declaration_name),
+            GrenSyntaxDeclaration::Variable { start_name, .. } => {
+                start_name.value.as_ref() == declaration_name
+            }
+            GrenSyntaxDeclaration::Operator { .. } => false,
+        })
+        .map(|declaration_node| (Box::from(module_origin), gren_syntax_node_as_ref(declaration_node)))
+}
+fn local_binding_operator_function_type(
+    type_resolution: &LocalBindingTypeResolution,
+    operator: &str,
+) -> Option<GrenResolvedTypeInModule> {
+    let module_origin: &str = look_up_origin_module(
+        &type_resolution.module_origin_lookup,
+        GrenQualified {
+            qualification: "",
+            name: operator,
+        },
+    );
+    let (_, origin_module_state) = project_state_get_module_with_name(
+        type_resolution.state,
+        type_resolution.project,
+        module_origin,
+    )?;
+    let operator_function_name: &str = origin_module_state
+        .syntax
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .filter_map(|documented_declaration| documented_declaration.declaration.as_ref())
+        .find_map(|declaration_node| match &declaration_node.value {
+            GrenSyntaxDeclaration::Operator {
+                direction: _,
+                precedence: _,
+                operator: maybe_operator,
+                equals_key_symbol_range: _,
+                function: maybe_function,
+            } => {
+                if maybe_operator
+                    .as_ref()
+                    .is_some_and(|operator_node| operator_node.value == operator)
+                {
+                    maybe_function
+                        .as_ref()
+                        .map(|function_node| function_node.value.as_ref())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })?;
+    origin_module_state
+        .syntax
+        .declarations
+        .iter()
+        .filter_map(|declaration_or_err| declaration_or_err.as_ref().ok())
+        .filter_map(|documented_declaration| documented_declaration.declaration.as_ref())
+        .find_map(|declaration_node| match &declaration_node.value {
+            GrenSyntaxDeclaration::Variable {
+                start_name,
+                signature: Some(signature),
+                ..
+            } if start_name.value.as_ref() == operator_function_name => signature
+                .type_
+                .as_ref()
+                .map(|signature_type_node| GrenResolvedTypeInModule {
+                    type_: Box::from(signature_type_node.value.clone()),
+                    origin_module: Box::from(module_origin),
+                }),
+            _ => None,
+        })
+}
+type GrenTypeSubstitutions = Vec<(
+    /* type variable name */ Box<str>,
+    /* substituted type */ Box<GrenSyntaxType>,
+)>;
+fn local_binding_substitutions_for_parameters(
+    parameters: &[GrenSyntaxNode<Box<str>>],
+    arguments: &[GrenSyntaxNode<GrenSyntaxType>],
+) -> GrenTypeSubstitutions {
+    parameters
+        .iter()
+        .zip(arguments.iter())
+        .map(|(parameter_node, argument_node)| {
+            (
+                parameter_node.value.clone(),
+                Box::from(argument_node.value.clone()),
+            )
+        })
+        .collect()
+}
+// boxes keep every resolved type uniformly owned, so that
+// cloning resolved types stays cheap and recursive construction is possible
+#[allow(clippy::unnecessary_box_returns)]
+fn gren_syntax_type_substitute(
+    gren_syntax_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    type_substitutions: &GrenTypeSubstitutions,
+    recursion_depth: u8,
+) -> Box<GrenSyntaxType> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return Box::from(gren_syntax_type_node.value.clone());
+    }
+    match gren_syntax_type_node.value {
+        GrenSyntaxType::Variable(name) => match type_substitutions
+            .iter()
+            .find(|(substituted_name, _)| substituted_name.as_ref() == name.as_ref())
+        {
+            // substituted types are built from use-site arguments and are therefore already closed
+            Some((_, substituted_type)) => Box::from((**substituted_type).clone()),
+            None => Box::from(gren_syntax_type_node.value.clone()),
+        },
+        GrenSyntaxType::Parenthesized(maybe_in_parens) => Box::from(GrenSyntaxType::Parenthesized(
+            maybe_in_parens.as_ref().map(|in_parens| GrenSyntaxNode {
+                range: in_parens.range,
+                value: gren_syntax_type_substitute(
+                    gren_syntax_node_unbox(in_parens),
+                    type_substitutions,
+                    recursion_depth + 1,
+                ),
+            }),
+        )),
+        GrenSyntaxType::Function {
+            input,
+            arrow_key_symbol_range,
+            output: maybe_output,
+        } => Box::from(GrenSyntaxType::Function {
+            input: GrenSyntaxNode {
+                range: input.range,
+                value: gren_syntax_type_substitute(
+                    gren_syntax_node_unbox(input),
+                    type_substitutions,
+                    recursion_depth + 1,
+                ),
+            },
+            arrow_key_symbol_range: *arrow_key_symbol_range,
+            output: maybe_output.as_ref().map(|output| GrenSyntaxNode {
+                range: output.range,
+                value: gren_syntax_type_substitute(
+                    gren_syntax_node_unbox(output),
+                    type_substitutions,
+                    recursion_depth + 1,
+                ),
+            }),
+        }),
+        GrenSyntaxType::Construct {
+            reference,
+            arguments,
+        } => Box::from(GrenSyntaxType::Construct {
+            reference: reference.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument_node| GrenSyntaxNode {
+                    range: argument_node.range,
+                    value: *gren_syntax_type_substitute(
+                        gren_syntax_node_as_ref(argument_node),
+                        type_substitutions,
+                        recursion_depth + 1,
+                    ),
+                })
+                .collect(),
+        }),
+        GrenSyntaxType::Record(fields) => Box::from(GrenSyntaxType::Record(
+            fields
+                .iter()
+                .map(|field| GrenSyntaxTypeField {
+                    name: field.name.clone(),
+                    colon_key_symbol_range: field.colon_key_symbol_range,
+                    value: field.value.as_ref().map(|field_type_node| GrenSyntaxNode {
+                        range: field_type_node.range,
+                        value: *gren_syntax_type_substitute(
+                            gren_syntax_node_as_ref(field_type_node),
+                            type_substitutions,
+                            recursion_depth + 1,
+                        ),
+                    }),
+                })
+                .collect(),
+        )),
+        GrenSyntaxType::RecordExtension {
+            record_variable,
+            bar_key_symbol_range,
+            fields,
+        } => Box::from(GrenSyntaxType::RecordExtension {
+            record_variable: record_variable.clone(),
+            bar_key_symbol_range: *bar_key_symbol_range,
+            fields: fields
+                .iter()
+                .map(|field| GrenSyntaxTypeField {
+                    name: field.name.clone(),
+                    colon_key_symbol_range: field.colon_key_symbol_range,
+                    value: field.value.as_ref().map(|field_type_node| GrenSyntaxNode {
+                        range: field_type_node.range,
+                        value: *gren_syntax_type_substitute(
+                            gren_syntax_node_as_ref(field_type_node),
+                            type_substitutions,
+                            recursion_depth + 1,
+                        ),
+                    }),
+                })
+                .collect(),
+        }),
+    }
+}
+fn gren_syntax_type_function_parameter_at_index(
+    function_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    parameter_index: usize,
+) -> Option<Box<GrenSyntaxType>> {
+    let mut current_type_node: GrenSyntaxNode<&GrenSyntaxType> = function_type_node;
+    let mut remaining_index: usize = parameter_index;
+    loop {
+        match current_type_node.value {
+            GrenSyntaxType::Function {
+                input,
+                arrow_key_symbol_range: _,
+                output: maybe_output,
+            } => {
+                if remaining_index == 0 {
+                    return Some(input.value.clone());
+                }
+                remaining_index -= 1;
+                current_type_node = gren_syntax_node_unbox(maybe_output.as_ref()?);
+            }
+            GrenSyntaxType::Parenthesized(Some(in_parens)) => {
+                current_type_node = gren_syntax_node_unbox(in_parens);
+            }
+            GrenSyntaxType::Construct { .. }
+            | GrenSyntaxType::Parenthesized(None)
+            | GrenSyntaxType::Record(_)
+            | GrenSyntaxType::RecordExtension { .. }
+            | GrenSyntaxType::Variable(_) => {
+                return None;
+            }
+        }
+    }
+}
+fn gren_syntax_type_result_after_applications(
+    function_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    applications_count: usize,
+) -> Option<Box<GrenSyntaxType>> {
+    let mut current_type_node: GrenSyntaxNode<&GrenSyntaxType> = function_type_node;
+    let mut remaining_applications: usize = applications_count;
+    loop {
+        match current_type_node.value {
+            GrenSyntaxType::Function {
+                input: _,
+                arrow_key_symbol_range: _,
+                output: maybe_output,
+            } => {
+                if remaining_applications == 0 {
+                    return Some(Box::from(current_type_node.value.clone()));
+                }
+                remaining_applications -= 1;
+                current_type_node = gren_syntax_node_unbox(maybe_output.as_ref()?);
+            }
+            GrenSyntaxType::Parenthesized(Some(in_parens)) => {
+                current_type_node = gren_syntax_node_unbox(in_parens);
+            }
+            GrenSyntaxType::Construct { .. }
+            | GrenSyntaxType::Parenthesized(None)
+            | GrenSyntaxType::Record(_)
+            | GrenSyntaxType::RecordExtension { .. }
+            | GrenSyntaxType::Variable(_) => {
+                if remaining_applications == 0 {
+                    return Some(Box::from(current_type_node.value.clone()));
+                }
+                return None;
+            }
+        }
+    }
+}
+#[allow(clippy::unnecessary_box_returns)]
+#[allow(clippy::vec_box)]
+fn local_binding_constructed_type(
+    name: &str,
+    arguments: Vec<Box<GrenSyntaxType>>,
+) -> Box<GrenSyntaxType> {
+    Box::from(GrenSyntaxType::Construct {
+        reference: GrenSyntaxNode {
+            range: lsp_types::Range::default(),
+            value: GrenQualifiedName {
+                qualification: Box::from(""),
+                name: Box::from(name),
+            },
+        },
+        arguments: arguments
+            .into_iter()
+            .map(|argument| GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: *argument,
+            })
+            .collect(),
+    })
 }
 
 fn respond_to_goto_definition(
@@ -3504,6 +6218,11 @@ fn respond_to_goto_definition(
                 },
             },
         )),
+        GrenSyntaxSymbol::RecordFieldAccess { .. }
+        | GrenSyntaxSymbol::RecordLiteralFieldName { .. } => {
+            // the field's declaring record type is not tracked, so no definition location
+            None
+        }
         GrenSyntaxSymbol::VariableOrVariantOrOperator {
             qualification: goto_qualification,
             name: goto_name,
@@ -3753,6 +6472,14 @@ fn respond_to_prepare_rename(
                 })
             }
         },
+        GrenSyntaxSymbol::RecordFieldAccess { .. }
+        | GrenSyntaxSymbol::RecordLiteralFieldName { .. } => {
+            Err(lsp_server::ResponseError {
+                code: lsp_server::ErrorCode::RequestFailed as i32,
+                message: "cannot rename a record field name".to_string(),
+                data: None,
+            })
+        }
         GrenSyntaxSymbol::VariableOrVariantOrOperator {
             qualification: _,
             name,
@@ -3947,6 +6674,12 @@ fn respond_to_rename(
                     })
                     .collect::<Vec<_>>(),
             }]
+        }
+        GrenSyntaxSymbol::RecordFieldAccess { .. }
+        | GrenSyntaxSymbol::RecordLiteralFieldName { .. } => {
+            // renaming a record field means renaming it at its declaration and every use,
+            // which is not supported
+            vec![]
         }
         GrenSyntaxSymbol::ModuleName(module_name_to_rename) => state
             .projects
@@ -4551,6 +7284,11 @@ fn respond_to_references(
                     range: use_range_of_found_module,
                 })
                 .collect::<Vec<_>>()
+        }
+        GrenSyntaxSymbol::RecordFieldAccess { .. }
+        | GrenSyntaxSymbol::RecordLiteralFieldName { .. } => {
+            // uses of a record field name are not tracked
+            vec![]
         }
         GrenSyntaxSymbol::VariableOrVariantOrOperator {
             qualification: to_find_qualification,
@@ -5769,6 +8507,11 @@ fn respond_to_completion(
             }
             Some(completion_items)
         }
+        GrenSyntaxSymbol::RecordFieldAccess { .. }
+        | GrenSyntaxSymbol::RecordLiteralFieldName { .. } => {
+            // no dedicated completions for record field names
+            None
+        }
         GrenSyntaxSymbol::LocalVariable {
             name: to_complete_name,
             origin: _,
@@ -6659,6 +9402,8 @@ fn respond_to_code_action(
         GrenSyntaxSymbol::ModuleMemberDeclarationName { .. } => None,
         GrenSyntaxSymbol::ImportExpose { .. } => None,
         GrenSyntaxSymbol::TypeVariable { .. } => None,
+        GrenSyntaxSymbol::RecordFieldAccess { .. } => None,
+        GrenSyntaxSymbol::RecordLiteralFieldName { .. } => None,
         GrenSyntaxSymbol::LocalVariable { .. } => None,
         GrenSyntaxSymbol::VariableOrVariantOrOperator {
             qualification,
@@ -7913,6 +10658,7 @@ fn gren_expose_set_contains(expose_set: &GrenExposeSet, name_to_check: &str) -> 
 
 /// Create through `module_origin_lookup_for_implicit_imports` or
 /// `gren_syntax_module_create_origin_lookup`
+#[derive(Clone)]
 struct ModuleOriginLookup<'a> {
     unqualified: std::collections::HashMap<&'a str, &'a str>,
     uniquely_qualified: std::collections::HashMap<&'a str, &'a str>,
@@ -12217,6 +14963,20 @@ enum GrenSyntaxSymbol<'a> {
         scope: Option<GrenSyntaxNode<&'a GrenSyntaxExpression>>,
         local_bindings: GrenLocalBindings<'a>,
     },
+    // `record.field`: hovering the field name. The type comes from resolving the record expression.
+    RecordFieldAccess {
+        record_expression: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+        field_name: &'a str,
+        local_bindings: GrenLocalBindings<'a>,
+    },
+    // `{ field = value }` or `{ field }`: hovering the field name.
+    // The type comes from the expected type at that position (e.g. a call argument)
+    // or, as a fallback, from the field value.
+    RecordLiteralFieldName {
+        field_name: &'a str,
+        field_value: Option<GrenSyntaxNode<&'a GrenSyntaxExpression>>,
+        local_bindings: GrenLocalBindings<'a>,
+    },
     VariableOrVariantOrOperator {
         qualification: &'a str,
         name: &'a str,
@@ -13275,6 +16035,18 @@ fn gren_syntax_expression_find_symbol_at_position<'a>(
             None => std::ops::ControlFlow::Continue(local_bindings),
         },
         GrenSyntaxExpression::Record(fields) => {
+            for field in fields {
+                if lsp_range_includes_position(field.name.range, position) {
+                    return std::ops::ControlFlow::Break(GrenSyntaxNode {
+                        range: field.name.range,
+                        value: GrenSyntaxSymbol::RecordLiteralFieldName {
+                            field_name: &field.name.value,
+                            field_value: field.value.as_ref().map(gren_syntax_node_as_ref),
+                            local_bindings: local_bindings,
+                        },
+                    });
+                }
+            }
             fields
                 .iter()
                 .try_fold(local_bindings, |local_bindings, field| match &field.value {
@@ -13287,7 +16059,22 @@ fn gren_syntax_expression_find_symbol_at_position<'a>(
                     None => std::ops::ControlFlow::Continue(local_bindings),
                 })
         }
-        GrenSyntaxExpression::RecordAccess { record, field: _ } => {
+        GrenSyntaxExpression::RecordAccess {
+            record,
+            field: maybe_field,
+        } => {
+            if let Some(field_node) = maybe_field
+                && lsp_range_includes_position(field_node.range, position)
+            {
+                return std::ops::ControlFlow::Break(GrenSyntaxNode {
+                    range: field_node.range,
+                    value: GrenSyntaxSymbol::RecordFieldAccess {
+                        record_expression: gren_syntax_node_unbox(record),
+                        field_name: &field_node.value,
+                        local_bindings: local_bindings,
+                    },
+                });
+            }
             gren_syntax_expression_find_symbol_at_position(
                 local_bindings,
                 scope_declaration,
@@ -13303,6 +16090,18 @@ fn gren_syntax_expression_find_symbol_at_position<'a>(
             bar_key_symbol_range: _,
             fields,
         } => {
+            for field in fields {
+                if lsp_range_includes_position(field.name.range, position) {
+                    return std::ops::ControlFlow::Break(GrenSyntaxNode {
+                        range: field.name.range,
+                        value: GrenSyntaxSymbol::RecordLiteralFieldName {
+                            field_name: &field.name.value,
+                            field_value: field.value.as_ref().map(gren_syntax_node_as_ref),
+                            local_bindings: local_bindings,
+                        },
+                    });
+                }
+            }
             if let Some(record_node) = maybe_record
                 && lsp_range_includes_position(record_node.range, position)
             {

@@ -65,7 +65,9 @@ link-zed:
 
 # Link the built binary into VS Code's globalStorage. Also writes the `version`
 # file VS Code requires (extension.ts checks it) to use the binary instead of
-# re-downloading and clobbering the symlink.
+# re-downloading and clobbering the symlink. The version written is the
+# INSTALLED extension's version: if it differs from vscode/package.json,
+# the extension would otherwise re-download its release over the symlink.
 link-vscode:
     #!/usr/bin/env sh
     set -eu
@@ -78,9 +80,14 @@ link-vscode:
     mkdir -p "{{VSCODE_DIR}}"
     rm -f "$target"
     ln -s "{{BINARY}}" "$target"
-    version=$(jq -r .version "{{justfile_directory()}}/vscode/package.json")
-    echo "$version" > "{{VSCODE_DIR}}/version"
-    echo "vscode: $target -> {{BINARY}} (version $version)"
+    installed_ext_dir=$(ls -d "$HOME"/.vscode/extensions/*gren-language-server-unofficial-* 2>/dev/null | tail -1 || true)
+    installed_version=${installed_ext_dir##*-}
+    if [ -z "$installed_version" ]; then
+        installed_version=$(jq -r .version "{{justfile_directory()}}/vscode/package.json")
+        echo "vscode: installed extension not found, falling back to package.json version" >&2
+    fi
+    echo "$installed_version" > "{{VSCODE_DIR}}/version"
+    echo "vscode: $target -> {{BINARY}} (cache key: installed extension version $installed_version)"
 
 # Remove the Zed dev symlink (leaves a real directory in place).
 unlink-zed:
