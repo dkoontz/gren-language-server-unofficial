@@ -1,0 +1,5 @@
+module LongImportExposingWrapsToNewLines exposing (main)
+
+import ManyExports exposing (helperA, helperB, helperC, helperD, helperE, helperF, helperG, helperH, helperI, helperJ, helperK, helperL, helperM, helperN, helperO, helperP)
+
+main = 0

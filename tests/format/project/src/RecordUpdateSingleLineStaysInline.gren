@@ -1,0 +1,3 @@
+module RecordUpdateSingleLineStaysInline exposing (update)
+
+update record = { record | a = 1, b = 2 }

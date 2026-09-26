@@ -1,0 +1,5 @@
+module ShortExposingStaysSingleLine exposing (main, other)
+
+
+main =
+    0

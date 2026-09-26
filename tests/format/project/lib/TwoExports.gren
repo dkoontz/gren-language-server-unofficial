@@ -1,0 +1,5 @@
+module TwoExports exposing (one, two)
+
+one = 0
+
+two = 0

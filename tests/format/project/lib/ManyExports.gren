@@ -1,0 +1,33 @@
+module ManyExports exposing (helperA, helperB, helperC, helperD, helperE, helperF, helperG, helperH, helperI, helperJ, helperK, helperL, helperM, helperN, helperO, helperP)
+
+helperA = 0
+
+helperB = 0
+
+helperC = 0
+
+helperD = 0
+
+helperE = 0
+
+helperF = 0
+
+helperG = 0
+
+helperH = 0
+
+helperI = 0
+
+helperJ = 0
+
+helperK = 0
+
+helperL = 0
+
+helperM = 0
+
+helperN = 0
+
+helperO = 0
+
+helperP = 0

@@ -1,0 +1,8 @@
+module ImportExposingMultilineStaysMultiline exposing (main)
+
+import TwoExports exposing
+    ( one
+    , two
+    )
+
+main = 0

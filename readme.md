@@ -89,6 +89,12 @@ Rebuild the project with
 ```bash
 cargo install --debug --offline --path . gren-language-server-unofficial
 ```
+### formatter tests
+After a change to the builtin formatter, run
+```bash
+just test
+```
+This formats every module in `tests/format/project/src` through the language server. The output must match the snapshot in `tests/format/expected`. After an intentional behavior change, regenerate the snapshots with `just test-update` and review the diff.
 
 ### Install local copy of LSP
 When testing changes to the LSP or editor extensions you can symlink the LSP binary to the following locations so you do not have to copy the file after every change.

@@ -1,0 +1,12 @@
+{
+    "type": "application",
+    "source-directories": [
+        "src",
+        "lib"
+    ],
+    "gren-version": "0.6.3",
+    "dependencies": {
+        "direct": {},
+        "indirect": {}
+    }
+}

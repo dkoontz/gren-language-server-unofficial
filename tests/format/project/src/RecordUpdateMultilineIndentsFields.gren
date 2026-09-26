@@ -1,0 +1,17 @@
+module RecordUpdateMultilineIndentsFields exposing (update)
+
+type Msg = Disconnected
+
+update msg model =
+    when msg is
+        Disconnected ->
+            { model =
+                { model
+                | pwmMotorToken = Nothing
+                , pwmMotorOn = False
+                , sparkMaxToken = Nothing
+                , talonFXSToken = Nothing
+                , talonFXToken = Nothing
+                }
+            , effects = []
+            }

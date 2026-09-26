@@ -1,0 +1,6 @@
+module ExposingMultilineStaysMultiline exposing
+    ( first
+    , second
+    )
+
+main = 0

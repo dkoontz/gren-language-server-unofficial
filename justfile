@@ -39,6 +39,22 @@ build:
     cargo build --release
 
 # ------------------------------------------------------------------------------
+# tests
+# ------------------------------------------------------------------------------
+
+# Run the formatter regression tests (builds the debug binary first).
+# node >= 23.6 runs typescript files natively.
+test:
+    cargo build
+    node tests/format/runFormatTests.ts
+
+# Regenerate formatter test snapshots after an intentional formatter change.
+# Review the diff in tests/format/expected afterwards.
+test-update:
+    cargo build
+    node tests/format/runFormatTests.ts --update
+
+# ------------------------------------------------------------------------------
 # symlinks
 # ------------------------------------------------------------------------------
 

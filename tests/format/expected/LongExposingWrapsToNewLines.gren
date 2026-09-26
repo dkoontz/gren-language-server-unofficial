@@ -1,0 +1,23 @@
+module LongExposingWrapsToNewLines exposing
+    ( OmegaType(..)
+    , aVeryLongExportedFunctionName
+    , alpha
+    , anotherLongExportedValue
+    , beta
+    , delta
+    , epsilon
+    , eta
+    , gamma
+    , iota
+    , kappa
+    , lambda
+    , mu
+    , nu
+    , theta
+    , yetAnotherExportedThing
+    , zeta
+    )
+
+
+main =
+    0
