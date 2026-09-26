@@ -8,6 +8,8 @@ Then point your editor to `gren-language-server-unofficial`, see also [specific 
 To specify gren-related executables, use these language server settings:
 - `gren-language-server-unofficial.grenPath: string`: compiler executable, default `"gren"`. If the language server can't find it in the `$PATH`, please set this option to the path that `which gren` prints :)
 - `gren-language-server-unofficial.grenFormatPath: "builtin" | string`: formatter executable, default `"builtin"`. `"builtin"` is a fast, unofficial rust formatter
+  - module and import `exposing` lists stay on one line up to 100 characters. Beyond that, or with source line breaks, each expose goes on its own line
+  - a multi-line record update indents the `| field` lines one level past the opening `{` and aligns the closing `}` with the `{`
 
 ## editor setups
 feel free to contribute, as I only use vscodium

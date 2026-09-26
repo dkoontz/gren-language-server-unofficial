@@ -13223,11 +13223,11 @@ fn gren_syntax_expression_not_parenthesized_into(
                 );
                 previous_syntax_end = record_node.range.end;
             }
-            space_or_linebreak_indented_into(so_far, line_span, indent);
+            space_or_linebreak_indented_into(so_far, line_span, next_indent(indent));
             so_far.push_str("| ");
             if let Some((field0, field1_up)) = fields.split_first() {
                 previous_syntax_end = gren_syntax_expression_fields_into(
-                    so_far, indent, comments, line_span, field0, field1_up,
+                    so_far, next_indent(indent), comments, line_span, field0, field1_up,
                 );
             }
             space_or_linebreak_indented_into(so_far, line_span, indent);
@@ -14310,15 +14310,19 @@ fn gren_syntax_module_header_into(
             so_far.push_str(" }");
         }
     }
-    so_far.push_str(" exposing ");
+    so_far.push_str(" exposing");
     match &gren_syntax_module_header.exposing {
         Some(module_header_exposing_node) => {
             // respect @docs grouping like elm-format does?
-            gren_syntax_exposing_into(so_far, &module_header_exposing_node.value);
+            gren_syntax_exposing_into(
+                so_far,
+                module_header_exposing_node.range,
+                &module_header_exposing_node.value,
+            );
             module_header_exposing_node.range.end
         }
         None => {
-            so_far.push_str("()");
+            so_far.push_str(" ()");
             gren_syntax_module_header
                 .exposing_keyword_range
                 .map(|range| range.end)
@@ -14326,25 +14330,72 @@ fn gren_syntax_module_header_into(
         }
     }
 }
-fn gren_syntax_exposing_into(so_far: &mut String, gren_syntax_exposing: &GrenSyntaxExposing) {
+/// When a single-line `exposing` list would make the module or import line longer
+/// than this, break it onto multiple lines with one expose per line.
+const EXPOSING_BREAK_LINE_LENGTH: usize = 100;
+
+fn so_far_current_line_length(so_far: &str) -> usize {
+    match so_far.rfind('\n') {
+        Some(last_linebreak_index) => so_far.len() - last_linebreak_index - 1,
+        None => so_far.len(),
+    }
+}
+
+/// `so_far` already ends with ` exposing` (without trailing space).
+/// Breaks onto multiple lines when the source exposing list spans multiple lines
+/// or when the single-line variant would exceed [`EXPOSING_BREAK_LINE_LENGTH`].
+fn gren_syntax_expose_strings_into_exposing_into(
+    so_far: &mut String,
+    source_contains_linebreak: bool,
+    expose_strings: &std::collections::BTreeSet<std::borrow::Cow<str>>,
+) {
+    let mut expose_strings_iterator = expose_strings.iter();
+    if let Some(expose_string0) = expose_strings_iterator.next() {
+        // " (" + join(", ") + ")"
+        let single_line_length: usize =
+            expose_strings.iter().map(|s| s.len() + 2).sum::<usize>() + 1;
+        let break_onto_multiple_lines = source_contains_linebreak
+            || so_far_current_line_length(so_far) + single_line_length
+                > EXPOSING_BREAK_LINE_LENGTH;
+        if break_onto_multiple_lines {
+            so_far.push_str("\n    ( ");
+            so_far.push_str(expose_string0);
+            for expose_string in expose_strings_iterator {
+                so_far.push_str("\n    , ");
+                so_far.push_str(expose_string);
+            }
+            so_far.push_str("\n    )");
+        } else {
+            so_far.push_str(" (");
+            so_far.push_str(expose_string0);
+            for expose_string in expose_strings_iterator {
+                so_far.push_str(", ");
+                so_far.push_str(expose_string);
+            }
+            so_far.push(')');
+        }
+    } else {
+        so_far.push_str(" ()");
+    }
+}
+fn gren_syntax_exposing_into(
+    so_far: &mut String,
+    exposing_source_range: lsp_types::Range,
+    gren_syntax_exposing: &GrenSyntaxExposing,
+) {
     match gren_syntax_exposing {
         GrenSyntaxExposing::All(_) => {
-            so_far.push_str("(..)");
+            so_far.push_str(" (..)");
         }
         GrenSyntaxExposing::Explicit(exposes) => {
-            so_far.push('(');
             let mut expose_strings: std::collections::BTreeSet<std::borrow::Cow<str>> =
                 std::collections::BTreeSet::new();
             gren_syntax_exposes_into_expose_strings(&mut expose_strings, exposes);
-            let mut expose_strings_iterator = expose_strings.into_iter();
-            if let Some(expose_string0) = expose_strings_iterator.next() {
-                so_far.push_str(&expose_string0);
-                for expose_string in expose_strings_iterator {
-                    so_far.push_str(", ");
-                    so_far.push_str(&expose_string);
-                }
-            }
-            so_far.push(')');
+            gren_syntax_expose_strings_into_exposing_into(
+                so_far,
+                exposing_source_range.start.line != exposing_source_range.end.line,
+                &expose_strings,
+            );
         }
     }
 }
@@ -14397,16 +14448,12 @@ fn gren_syntax_imports_then_linebreak_into(
             }
             GrenExposingStrings::Explicit(expose_strings) => {
                 if !expose_strings.is_empty() {
-                    so_far.push_str(" exposing (");
-                    let mut expose_strings_iterator = expose_strings.into_iter();
-                    if let Some(expose_string0) = expose_strings_iterator.next() {
-                        so_far.push_str(&expose_string0);
-                        for expose_string in expose_strings_iterator {
-                            so_far.push_str(", ");
-                            so_far.push_str(&expose_string);
-                        }
-                    }
-                    so_far.push(')');
+                    so_far.push_str(" exposing");
+                    gren_syntax_expose_strings_into_exposing_into(
+                        so_far,
+                        import_of_module_name_summary.exposing_multiline,
+                        &expose_strings,
+                    );
                 }
             }
         }
@@ -14437,13 +14484,17 @@ fn gren_syntax_imports_then_linebreak_into(
             .is_some()
             || import_without_module_name_node.value.exposing.is_some()
         {
-            so_far.push_str(" exposing ");
+            so_far.push_str(" exposing");
             match &import_without_module_name_node.value.exposing {
                 None => {
-                    so_far.push_str("()");
+                    so_far.push_str(" ()");
                 }
                 Some(import_exposing_node) => {
-                    gren_syntax_exposing_into(so_far, &import_exposing_node.value);
+                    gren_syntax_exposing_into(
+                        so_far,
+                        import_exposing_node.range,
+                        &import_exposing_node.value,
+                    );
                 }
             }
         }
@@ -14454,6 +14505,7 @@ struct GrenImportOfModuleNameSummary<'a> {
     alias_required: bool,
     aliases: std::collections::BTreeSet<&'a str>,
     exposing: GrenExposingStrings<'a>,
+    exposing_multiline: bool,
 }
 enum GrenExposingStrings<'a> {
     All,
@@ -14482,6 +14534,12 @@ fn gren_syntax_import_merge_to_summary<'a>(
                 }
             },
         },
+        exposing_multiline: match &gren_syntax_import.exposing {
+            None => false,
+            Some(import_exposing) => {
+                import_exposing.range.start.line != import_exposing.range.end.line
+            }
+        },
     }
 }
 fn gren_syntax_import_merge_into_summary<'a>(
@@ -14497,6 +14555,10 @@ fn gren_syntax_import_merge_into_summary<'a>(
                 .aliases
                 .insert(import_alias_name_node.value.as_ref());
         }
+    }
+    if let Some(import_exposing) = &gren_syntax_import.exposing {
+        summary_to_merge_with.exposing_multiline |=
+            import_exposing.range.start.line != import_exposing.range.end.line;
     }
     match (
         &mut summary_to_merge_with.exposing,
