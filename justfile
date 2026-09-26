@@ -1,5 +1,6 @@
 # Development tasks for the gren language server.
 #
+# `just bump-version X.Y.Z`  raise the extension version everywhere
 # `just link`    symlink the binary into Zed and VS Code
 # `just unlink`  remove those dev symlinks
 # `just status`  show the current link state
@@ -7,6 +8,35 @@
 # Print available recipes.
 default:
     @just --list
+
+# ------------------------------------------------------------------------------
+# release
+# ------------------------------------------------------------------------------
+
+# Bump the extension version in every file that pins it:
+#   vscode/package.json, zed/extension.toml, zed/Cargo.toml,
+#   zed/Cargo.lock and zed/src/lib.rs.
+# Usage: just bump-version 0.0.4
+# Afterward: commit, push, then run the "Release" action on GitHub. The action
+# reads this version, creates the v<version> tag and publishes the release.
+bump-version version:
+    #!/usr/bin/env sh
+    set -eu
+    new_version="{{version}}"
+    echo "$new_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+        echo "bump-version: '$new_version' is not a X.Y.Z version" >&2
+        exit 1
+    }
+    perl -pi -e 's/^  "version": ".*",$/  "version": "{{version}}",/' vscode/package.json
+    perl -pi -e 's/^version = ".*"$/version = "{{version}}"/' zed/extension.toml
+    perl -pi -e 's/^version = ".*"$/version = "{{version}}"/' zed/Cargo.toml
+    perl -0pi -e 's/(\[\[package\]\]\nname = "gren-zed-extension-unofficial"\nversion = ")[^"]*(")/${1}{{version}}$2/' zed/Cargo.lock
+    perl -pi -e 's/^const VERSION: &str = ".*";$/const VERSION: \&str = "{{version}}";/' zed/src/lib.rs
+    echo "bumped to $new_version:"
+    grep '"version":' vscode/package.json
+    grep '^version = ' zed/extension.toml zed/Cargo.toml
+    grep '^const VERSION' zed/src/lib.rs
+    echo "next: commit, push, then run the \"Release\" action on GitHub"
 
 # ------------------------------------------------------------------------------
 # configuration

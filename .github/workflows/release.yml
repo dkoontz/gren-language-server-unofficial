@@ -1,13 +1,46 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(jq -r .version vscode/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify all pinned versions agree
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          fail() {
+            echo "::error::$1 is '$2' but vscode/package.json is '$version'. Run 'just bump-version' locally and push."
+            exit 1
+          }
+          zed_extension=$(sed -n 's/^version = "\(.*\)"$/\1/p' zed/extension.toml)
+          [ "$zed_extension" = "$version" ] || fail zed/extension.toml "$zed_extension"
+          zed_cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' zed/Cargo.toml)
+          [ "$zed_cargo" = "$version" ] || fail zed/Cargo.toml "$zed_cargo"
+          zed_lib=$(sed -n 's/^const VERSION: &str = "\(.*\)";$/\1/p' zed/src/lib.rs)
+          [ "$zed_lib" = "$version" ] || fail zed/src/lib.rs "$zed_lib"
+          zed_lock=$(awk '/^name = "gren-zed-extension-unofficial"$/ { getline; gsub(/^version = "|"$/, ""); print; exit }' zed/Cargo.lock)
+          [ "$zed_lock" = "$version" ] || fail zed/Cargo.lock "$zed_lock"
+
+      - name: Verify tag does not already exist
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1; then
+            echo "::error::tag v$version already exists. Run 'just bump-version' to raise the version, then push before releasing."
+            exit 1
+          fi
+
   build:
+    needs: version
     strategy:
       matrix:
         include:
@@ -58,6 +91,7 @@ jobs:
             gren-language-server-unofficial-${{ matrix.target }}.zip
 
   vsix:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +110,7 @@ jobs:
           path: vscode/*.vsix
 
   release:
-    needs: [build, vsix]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version, build, vsix]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -89,4 +122,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/gren-language-server-unofficial-*
