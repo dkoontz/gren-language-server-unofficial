@@ -478,12 +478,30 @@ fn update_projects_state_on_gren_json_changes(
                 }
             }
             None => {
+                let mut new_project_modules: std::collections::HashMap<
+                    std::path::PathBuf,
+                    ModuleState,
+                > = initialize_project_modules(
+                    // package archive modules cannot be read from disk
+                    uninitialized_project
+                        .modules
+                        .keys()
+                        .filter(|module_path| !is_pkg_gz_module_path(module_path))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                );
+                // package archive modules were already parsed while indexing
+                // the archive; keep their parsed state as is
+                for (module_path, module_state) in uninitialized_project.modules {
+                    if is_pkg_gz_module_path(&module_path) {
+                        new_project_modules.insert(module_path, module_state);
+                    }
+                }
                 projects_state.insert(
                     uninitialized_project_path,
                     ProjectState {
-                        modules: initialize_project_modules(
-                            uninitialized_project.modules.into_keys(),
-                        ),
+                        modules: new_project_modules,
                         source_directories: uninitialized_project.source_directories,
                         dependency_exposed_module_names: uninitialized_project
                             .dependency_exposed_module_names,
@@ -1257,7 +1275,15 @@ fn initialize_projects_state_for_workspace_directories_into(
     let (fully_parsed_project_sender, fully_parsed_project_receiver) = std::sync::mpsc::channel();
     std::thread::scope(|thread_scope| {
         for (uninitialized_project_path, uninitialized_project_state) in projects_state.iter() {
-            if uninitialized_project_state.kind == ProjectKind::Dependency {
+            if uninitialized_project_state.kind == ProjectKind::Dependency
+                // package archive dependencies are already fully parsed;
+                // their virtual module paths cannot be read from disk.
+                // directory dependencies (local:../path) still need parsing.
+                && uninitialized_project_state
+                    .modules
+                    .keys()
+                    .all(|module_path| is_pkg_gz_module_path(module_path))
+            {
                 continue;
             }
             let projects_that_finished_full_parse_sender = fully_parsed_project_sender.clone();
@@ -4216,6 +4242,16 @@ fn local_binding_expression_expected_type_at_position<'a>(
                             type_: result_type,
                             origin_module: expected_type.origin_module.clone(),
                         })?;
+                    // the body sees its own parameters, e.g. a piped
+                    // `value |> ...` chain inside the lambda body resolves
+                    // `value` to the lambda parameter's type
+                    for parameter_node in parameters {
+                        gren_syntax_pattern_bindings_for_scope_into(
+                            local_bindings,
+                            maybe_result.as_ref().map(gren_syntax_node_unbox),
+                            gren_syntax_node_as_ref(parameter_node),
+                        );
+                    }
                     match maybe_result {
                         Some(result_node) => local_binding_expression_expected_type_at_position(
                             type_resolution,
@@ -4466,27 +4502,72 @@ fn local_binding_expression_expected_type_at_position<'a>(
                         }
                         _ => gren_syntax_node_unbox(right_node),
                     };
-                if let GrenSyntaxExpression::Call {
-                    called: right_called,
-                    argument0: right_argument0,
-                    argument1_up: right_argument1_up,
-                } = right_unparenthesized.value
-                {
-                    let found_in_piped_call: Option<GrenResolvedTypeInModule> =
-                        local_binding_call_argument_expected_type_at_position(
-                            type_resolution,
-                            local_bindings,
-                            gren_syntax_node_unbox(right_called),
-                            &std::iter::once(gren_syntax_node_unbox(right_argument0))
-                                .chain(right_argument1_up.iter().map(gren_syntax_node_as_ref))
-                                .chain(std::iter::once(gren_syntax_node_unbox(left)))
-                                .collect::<Vec<_>>(),
-                            maybe_expected_type,
-                            target_position,
-                            recursion_depth,
-                        );
-                    if found_in_piped_call.is_some() {
-                        return found_in_piped_call;
+                match right_unparenthesized.value {
+                    GrenSyntaxExpression::Call {
+                        called: right_called,
+                        argument0: right_argument0,
+                        argument1_up: right_argument1_up,
+                    } => {
+                        let found_in_piped_call: Option<GrenResolvedTypeInModule> =
+                            local_binding_call_argument_expected_type_at_position(
+                                type_resolution,
+                                local_bindings,
+                                gren_syntax_node_unbox(right_called),
+                                &std::iter::once(gren_syntax_node_unbox(right_argument0))
+                                    .chain(
+                                        right_argument1_up.iter().map(gren_syntax_node_as_ref),
+                                    )
+                                    .chain(std::iter::once(gren_syntax_node_unbox(left)))
+                                    .collect::<Vec<_>>(),
+                                maybe_expected_type,
+                                target_position,
+                                recursion_depth,
+                            );
+                        if found_in_piped_call.is_some() {
+                            return found_in_piped_call;
+                        }
+                    }
+                    GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+                        left: first_step_node,
+                        operator: first_step_operator,
+                        right: maybe_rest_of_pipeline,
+                    } if first_step_operator.value == "|>" => {
+                        // `value |> step1 |> step2 ...` nests to the right:
+                        // `value |> (step1 |> step2 ...)`. Walk the chain so
+                        // every step sees the piped value's type
+                        let found_in_pipeline: Option<GrenResolvedTypeInModule> =
+                            local_binding_pipeline_expected_type_at_position(
+                                type_resolution,
+                                local_bindings,
+                                gren_syntax_node_unbox(left),
+                                gren_syntax_node_unbox(first_step_node),
+                                maybe_rest_of_pipeline
+                                    .as_ref()
+                                    .map(gren_syntax_node_unbox),
+                                maybe_expected_type,
+                                target_position,
+                                recursion_depth,
+                            );
+                        if found_in_pipeline.is_some() {
+                            return found_in_pipeline;
+                        }
+                    }
+                    _ => {
+                        // the piped value goes into a lambda, a bare function
+                        // reference or another expression without a usable
+                        // parameter type; walk it without an expected type
+                        let found_in_right: Option<GrenResolvedTypeInModule> =
+                            local_binding_expression_expected_type_at_position(
+                                type_resolution,
+                                local_bindings,
+                                right_unparenthesized,
+                                None,
+                                target_position,
+                                recursion_depth + 1,
+                            );
+                        if found_in_right.is_some() {
+                            return found_in_right;
+                        }
                     }
                 }
             } else if let Some(right_node) = right {
@@ -4593,6 +4674,485 @@ fn local_binding_call_argument_expected_type_at_position<'a>(
     )
 }
 
+// `value |> step1 |> step2 ...` nests to the right as
+// `value |> (step1 |> step2 ...)`, so the chain arrives here split into
+// the piped value, the first step and the rest of the pipeline.
+// Every step is walked as a call with the piped value as a final argument,
+// with each step's result type refining the next step's type variables,
+// e.g. `a` in `Task.andThen : (a -> Task e b) -> Task e a -> Task e b`
+// from the piped `Task String Int` value
+fn local_binding_pipeline_expected_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &mut GrenLocalBindings<'a>,
+    piped_value_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    first_step_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    maybe_rest_node: Option<GrenSyntaxNode<&'a GrenSyntaxExpression>>,
+    maybe_chain_expected_type: Option<&GrenResolvedTypeInModule>,
+    target_position: lsp_types::Position,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    // the first step is the whole chain when nothing follows it
+    let maybe_first_step_expected_type: Option<&GrenResolvedTypeInModule> =
+        if maybe_rest_node.is_some() {
+            None
+        } else {
+            maybe_chain_expected_type
+        };
+    // the first step sees the piped value itself as an argument
+    let first_step_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+        match first_step_node.value {
+            GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                gren_syntax_node_unbox(in_parens_node)
+            }
+            _ => first_step_node,
+        };
+    let found_in_first_step: Option<GrenResolvedTypeInModule> = match first_step_unparenthesized
+        .value
+    {
+        GrenSyntaxExpression::Call {
+            called: first_step_called,
+            argument0: first_step_argument0,
+            argument1_up: first_step_argument1_up,
+        } => local_binding_call_argument_expected_type_at_position(
+            type_resolution,
+            local_bindings,
+            gren_syntax_node_unbox(first_step_called),
+            &std::iter::once(gren_syntax_node_unbox(first_step_argument0))
+                .chain(first_step_argument1_up.iter().map(gren_syntax_node_as_ref))
+                .chain(std::iter::once(piped_value_node))
+                .collect::<Vec<_>>(),
+            maybe_first_step_expected_type,
+            target_position,
+            recursion_depth,
+        ),
+        _ => local_binding_piped_step_type_at_position(
+            type_resolution,
+            local_bindings,
+            first_step_unparenthesized,
+            local_binding_expression_type(
+                type_resolution,
+                local_bindings,
+                piped_value_node,
+                recursion_depth + 1,
+            )
+            .as_ref(),
+            maybe_first_step_expected_type,
+            target_position,
+            recursion_depth,
+        ),
+    };
+    if found_in_first_step.is_some() {
+        return found_in_first_step;
+    }
+    let maybe_piped_into_rest: Option<GrenResolvedTypeInModule> = local_binding_piped_step_result_type(
+        type_resolution,
+        local_bindings,
+        first_step_unparenthesized,
+        local_binding_expression_type(
+            type_resolution,
+            local_bindings,
+            piped_value_node,
+            recursion_depth + 1,
+        )
+        .as_ref(),
+        recursion_depth + 1,
+    );
+    match maybe_rest_node {
+        Some(rest_node) => local_binding_pipeline_rest_expected_type_at_position(
+            type_resolution,
+            local_bindings,
+            rest_node,
+            maybe_piped_into_rest.as_ref(),
+            maybe_chain_expected_type,
+            target_position,
+            recursion_depth + 1,
+        ),
+        None => None,
+    }
+}
+
+// walk the rest of a pipeline after its first step, where the piped value
+// is only known as a type: either another `step |> rest` link or the
+// chain's final expression
+fn local_binding_pipeline_rest_expected_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &mut GrenLocalBindings<'a>,
+    chain_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    maybe_piped_value_type: Option<&GrenResolvedTypeInModule>,
+    maybe_chain_expected_type: Option<&GrenResolvedTypeInModule>,
+    target_position: lsp_types::Position,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    let chain_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+        match chain_node.value {
+            GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                gren_syntax_node_unbox(in_parens_node)
+            }
+            _ => chain_node,
+        };
+    match chain_unparenthesized.value {
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left: step_node,
+            operator: step_operator,
+            right: maybe_next_node,
+        } if step_operator.value == "|>" => {
+            let step_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+                match step_node.value.as_ref() {
+                    GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                        gren_syntax_node_unbox(in_parens_node)
+                    }
+                    _ => gren_syntax_node_unbox(step_node),
+                };
+            // an intermediate step has no expected result type;
+            // only the chain's final expression sees the surrounding type
+            let maybe_step_expected_type: Option<&GrenResolvedTypeInModule> =
+                if maybe_next_node.is_some() {
+                    None
+                } else {
+                    maybe_chain_expected_type
+                };
+            let found_in_step: Option<GrenResolvedTypeInModule> =
+                local_binding_piped_step_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    step_unparenthesized,
+                    maybe_piped_value_type,
+                    maybe_step_expected_type,
+                    target_position,
+                    recursion_depth,
+                );
+            if found_in_step.is_some() {
+                return found_in_step;
+            }
+            let maybe_step_result_type: Option<GrenResolvedTypeInModule> =
+                local_binding_piped_step_result_type(
+                    type_resolution,
+                    local_bindings,
+                    step_unparenthesized,
+                    maybe_piped_value_type,
+                    recursion_depth + 1,
+                );
+            match maybe_next_node {
+                Some(next_node) => local_binding_pipeline_rest_expected_type_at_position(
+                    type_resolution,
+                    local_bindings,
+                    gren_syntax_node_unbox(next_node),
+                    maybe_step_result_type.as_ref(),
+                    maybe_chain_expected_type,
+                    target_position,
+                    recursion_depth + 1,
+                ),
+                None => None,
+            }
+        }
+        _ => local_binding_piped_step_type_at_position(
+            type_resolution,
+            local_bindings,
+            chain_unparenthesized,
+            maybe_piped_value_type,
+            maybe_chain_expected_type,
+            target_position,
+            recursion_depth,
+        ),
+    }
+}
+
+// one pipeline step whose piped value is only known as a type:
+// `piped_value |> step argument0 ...` behaves like `step argument0 ... piped_value`
+fn local_binding_piped_step_type_at_position<'a>(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &mut GrenLocalBindings<'a>,
+    step_node: GrenSyntaxNode<&'a GrenSyntaxExpression>,
+    maybe_piped_value_type: Option<&GrenResolvedTypeInModule>,
+    maybe_step_expected_type: Option<&GrenResolvedTypeInModule>,
+    target_position: lsp_types::Position,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    match step_node.value {
+        GrenSyntaxExpression::Call {
+            called: step_called,
+            argument0: step_argument0,
+            argument1_up: step_argument1_up,
+        } => {
+            let argument_nodes: Vec<GrenSyntaxNode<&GrenSyntaxExpression>> =
+                std::iter::once(gren_syntax_node_unbox(step_argument0))
+                    .chain(step_argument1_up.iter().map(gren_syntax_node_as_ref))
+                    .collect::<Vec<_>>();
+            let (argument_index, argument_node): (usize, GrenSyntaxNode<&GrenSyntaxExpression>) =
+                argument_nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(argument_index, argument_node)| {
+                        lsp_range_includes_position(argument_node.range, target_position)
+                            .then_some((argument_index, *argument_node))
+                    })?;
+            let called_type: GrenResolvedTypeInModule = local_binding_expression_type(
+                type_resolution,
+                local_bindings,
+                gren_syntax_node_unbox(step_called),
+                recursion_depth + 1,
+            )?;
+            let called_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &called_type.type_,
+            };
+            let argument_parameter_type: Box<GrenSyntaxType> =
+                gren_syntax_type_function_parameter_at_index(called_type_node, argument_index)?;
+            let refined_argument_expected_type: Box<GrenSyntaxType> =
+                local_binding_refine_type_variables_in_piped_argument_type(
+                    type_resolution,
+                    local_bindings,
+                    called_type_node,
+                    &argument_nodes,
+                    argument_index,
+                    &argument_parameter_type,
+                    maybe_piped_value_type,
+                    maybe_step_expected_type,
+                    recursion_depth,
+                );
+            local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                argument_node,
+                Some(&GrenResolvedTypeInModule {
+                    type_: refined_argument_expected_type,
+                    origin_module: called_type.origin_module,
+                }),
+                target_position,
+                recursion_depth + 1,
+            )
+        }
+        GrenSyntaxExpression::Lambda {
+            parameters,
+            arrow_key_symbol_range: _,
+            result: _,
+        } => {
+            // `piped_value |> \parameter -> ...` applies the lambda to
+            // the piped value, so the first parameter gets its type
+            if let Some(piped_value_type) = maybe_piped_value_type {
+                for (parameter_index, parameter_node) in parameters.iter().enumerate() {
+                    if parameter_index == 0
+                        && lsp_range_includes_position(parameter_node.range, target_position)
+                    {
+                        return Some(GrenResolvedTypeInModule {
+                            type_: piped_value_type.type_.clone(),
+                            origin_module: piped_value_type.origin_module.clone(),
+                        });
+                    }
+                }
+            }
+            local_binding_expression_expected_type_at_position(
+                type_resolution,
+                local_bindings,
+                step_node,
+                None,
+                target_position,
+                recursion_depth + 1,
+            )
+        }
+        _ => local_binding_expression_expected_type_at_position(
+            type_resolution,
+            local_bindings,
+            step_node,
+            None,
+            target_position,
+            recursion_depth + 1,
+        ),
+    }
+}
+
+// the type a pipeline step produces when applied to the piped value:
+// unify the step function's parameter types with its arguments' value types
+// and the piped value's type, then substitute the result type
+fn local_binding_piped_step_result_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    step_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    maybe_piped_value_type: Option<&GrenResolvedTypeInModule>,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    let (called_node, argument_nodes): (
+        GrenSyntaxNode<&GrenSyntaxExpression>,
+        Vec<GrenSyntaxNode<&GrenSyntaxExpression>>,
+    ) = match step_node.value {
+        GrenSyntaxExpression::Call {
+            called: step_called,
+            argument0: step_argument0,
+            argument1_up: step_argument1_up,
+        } => (
+            gren_syntax_node_unbox(step_called),
+            std::iter::once(gren_syntax_node_unbox(step_argument0))
+                .chain(step_argument1_up.iter().map(gren_syntax_node_as_ref))
+                .collect::<Vec<_>>(),
+        ),
+        // a bare function reference: `piped_value |> function`
+        GrenSyntaxExpression::Reference {
+            qualification: _,
+            name: _,
+        } => (step_node, Vec::new()),
+        _ => return None,
+    };
+    let called_type: GrenResolvedTypeInModule = local_binding_expression_type(
+        type_resolution,
+        local_bindings,
+        called_node,
+        recursion_depth + 1,
+    )?;
+    let called_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+        range: lsp_types::Range::default(),
+        value: &called_type.type_,
+    };
+    let mut type_substitutions: GrenTypeSubstitutions = Vec::new();
+    for (argument_index, argument_node) in argument_nodes.iter().enumerate() {
+        let Some(argument_parameter_type) =
+            gren_syntax_type_function_parameter_at_index(called_type_node, argument_index)
+        else {
+            continue;
+        };
+        local_binding_unify_argument_value_type_into(
+            type_resolution,
+            local_bindings,
+            &mut type_substitutions,
+            &argument_parameter_type,
+            *argument_node,
+            recursion_depth + 1,
+        );
+    }
+    // the piped value is the final argument
+    if let Some(piped_value_type) = maybe_piped_value_type
+        && let Some(piped_parameter_type) =
+            gren_syntax_type_function_parameter_at_index(called_type_node, argument_nodes.len())
+    {
+        local_binding_unify_types_into(
+            &mut type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &piped_parameter_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &piped_value_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+    // the piped value is the final argument, so it adds one application
+    // beyond the explicit ones, even when its own type is unknown
+    let result_type: Box<GrenSyntaxType> =
+        gren_syntax_type_result_after_applications(called_type_node, argument_nodes.len() + 1)?;
+    let substituted_result_type: Box<GrenSyntaxType> = if type_substitutions.is_empty() {
+        result_type
+    } else {
+        gren_syntax_type_substitute(
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &result_type,
+            },
+            &type_substitutions,
+            0,
+        )
+    };
+    Some(GrenResolvedTypeInModule {
+        type_: substituted_result_type,
+        origin_module: called_type.origin_module.clone(),
+    })
+}
+
+// like local_binding_refine_type_variables_in_argument_type, but the call is
+// a pipeline step: the final argument is the piped value, known only as a type
+#[allow(clippy::unnecessary_box_returns)]
+fn local_binding_refine_type_variables_in_piped_argument_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    called_type_node: GrenSyntaxNode<&GrenSyntaxType>,
+    argument_nodes: &[GrenSyntaxNode<&GrenSyntaxExpression>],
+    target_argument_index: usize,
+    argument_parameter_type: &GrenSyntaxType,
+    maybe_piped_value_type: Option<&GrenResolvedTypeInModule>,
+    maybe_call_expected_type: Option<&GrenResolvedTypeInModule>,
+    recursion_depth: u8,
+) -> Box<GrenSyntaxType> {
+    let argument_parameter_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+        range: lsp_types::Range::default(),
+        value: argument_parameter_type,
+    };
+    if !gren_syntax_type_has_variable(argument_parameter_type_node, 0) {
+        return Box::from(argument_parameter_type.clone());
+    }
+    let mut type_substitutions: GrenTypeSubstitutions = Vec::new();
+    // the piped value adds one application beyond the explicit arguments
+    if let Some(call_expected_type) = maybe_call_expected_type
+        && let Some(result_type) = gren_syntax_type_result_after_applications(
+            called_type_node,
+            argument_nodes.len() + 1,
+        )
+    {
+        local_binding_unify_types_into(
+            &mut type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &result_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &call_expected_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+    for (sibling_index, sibling_node) in argument_nodes.iter().enumerate() {
+        if sibling_index == target_argument_index {
+            continue;
+        }
+        let Some(sibling_parameter_type) =
+            gren_syntax_type_function_parameter_at_index(called_type_node, sibling_index)
+        else {
+            continue;
+        };
+        local_binding_unify_argument_value_type_into(
+            type_resolution,
+            local_bindings,
+            &mut type_substitutions,
+            &sibling_parameter_type,
+            *sibling_node,
+            recursion_depth + 1,
+        );
+    }
+    if let Some(piped_value_type) = maybe_piped_value_type
+        && let Some(piped_parameter_type) =
+            gren_syntax_type_function_parameter_at_index(called_type_node, argument_nodes.len())
+    {
+        local_binding_unify_types_into(
+            &mut type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &piped_parameter_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &piped_value_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+    if type_substitutions.is_empty() {
+        return Box::from(argument_parameter_type.clone());
+    }
+    gren_syntax_type_substitute(argument_parameter_type_node, &type_substitutions, 0)
+}
+
 // resolve type variables in a call argument's parameter type by binding them
 // to matching parts of the types known from the call's context.
 // The first binding wins, so the most authoritative source is unified first:
@@ -4645,24 +5205,12 @@ fn local_binding_refine_type_variables_in_argument_type(
         else {
             continue;
         };
-        let Some(sibling_value_type) = local_binding_expression_type(
+        local_binding_unify_argument_value_type_into(
             type_resolution,
             local_bindings,
-            *sibling_node,
-            recursion_depth + 1,
-        ) else {
-            continue;
-        };
-        local_binding_unify_types_into(
             &mut type_substitutions,
-            GrenSyntaxNode {
-                range: lsp_types::Range::default(),
-                value: &sibling_parameter_type,
-            },
-            GrenSyntaxNode {
-                range: lsp_types::Range::default(),
-                value: &sibling_value_type.type_,
-            },
+            &sibling_parameter_type,
+            *sibling_node,
             recursion_depth + 1,
         );
     }
@@ -4846,6 +5394,222 @@ fn local_binding_unify_types_into(
     }
 }
 
+// unify a call argument's parameter type with the argument's value type.
+// A lambda argument has no direct value type (its parameters are unknown),
+// but its body's type is its function type's output
+fn local_binding_unify_argument_value_type_into(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    type_substitutions: &mut GrenTypeSubstitutions,
+    argument_parameter_type: &GrenSyntaxType,
+    argument_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    recursion_depth: u8,
+) {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return;
+    }
+    let argument_parameter_type_node: GrenSyntaxNode<&GrenSyntaxType> = GrenSyntaxNode {
+        range: lsp_types::Range::default(),
+        value: argument_parameter_type,
+    };
+    if let Some(argument_value_type) = local_binding_expression_type(
+        type_resolution,
+        local_bindings,
+        argument_node,
+        recursion_depth + 1,
+    ) {
+        local_binding_unify_types_into(
+            type_substitutions,
+            argument_parameter_type_node,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &argument_value_type.type_,
+            },
+            recursion_depth + 1,
+        );
+        return;
+    }
+    // lambdas usually appear as arguments wrapped in parentheses
+    let argument_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+        match argument_node.value {
+            GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                gren_syntax_node_unbox(in_parens_node)
+            }
+            _ => argument_node,
+        };
+    if let GrenSyntaxExpression::Lambda {
+        parameters,
+        arrow_key_symbol_range: _,
+        result: Some(lambda_result_node),
+    } = argument_unparenthesized.value
+        && let Some(lambda_body_type) = {
+            // the lambda body sees its own parameters
+            let mut lambda_body_bindings: GrenLocalBindings = local_bindings.clone();
+            for parameter_node in parameters {
+                gren_syntax_pattern_bindings_for_scope_into(
+                    &mut lambda_body_bindings,
+                    Some(gren_syntax_node_unbox(lambda_result_node)),
+                    gren_syntax_node_as_ref(parameter_node),
+                );
+            }
+            let body_type = local_binding_expression_type(
+                type_resolution,
+                &lambda_body_bindings,
+                gren_syntax_node_unbox(lambda_result_node),
+                recursion_depth + 1,
+            );
+            body_type
+        }
+        && let Some(parameter_output_type) = gren_syntax_type_result_after_applications(
+            argument_parameter_type_node,
+            parameters.len(),
+        )
+    {
+        local_binding_unify_types_into(
+            type_substitutions,
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &parameter_output_type,
+            },
+            GrenSyntaxNode {
+                range: lsp_types::Range::default(),
+                value: &lambda_body_type.type_,
+            },
+            recursion_depth + 1,
+        );
+    }
+}
+
+// the value type of a multi-step pipeline `piped_value |> step1 |> step2 ...`,
+// where the parser nests the chain to the right:
+// `piped_value |> (step1 |> step2 ...)`
+fn local_binding_pipeline_value_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    piped_value_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    chain_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    let chain_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+        match chain_node.value {
+            GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                gren_syntax_node_unbox(in_parens_node)
+            }
+            _ => chain_node,
+        };
+    // the piped value's type can stay unknown, e.g. an `++` chain of
+    // appendables: the steps' own types still decide the chain's result
+    let maybe_piped_value_type: Option<GrenResolvedTypeInModule> = local_binding_expression_type(
+        type_resolution,
+        local_bindings,
+        piped_value_node,
+        recursion_depth + 1,
+    );
+    match chain_unparenthesized.value {
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left: step_node,
+            operator: step_operator,
+            right: maybe_next_node,
+        } if step_operator.value == "|>" => {
+            let step_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+                match step_node.value.as_ref() {
+                    GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                        gren_syntax_node_unbox(in_parens_node)
+                    }
+                    _ => gren_syntax_node_unbox(step_node),
+                };
+            let step_result_type: GrenResolvedTypeInModule = local_binding_piped_step_result_type(
+                type_resolution,
+                local_bindings,
+                step_unparenthesized,
+                maybe_piped_value_type.as_ref(),
+                recursion_depth + 1,
+            )?;
+            match maybe_next_node {
+                Some(next_node) => local_binding_pipeline_value_type_from_piped_type(
+                    type_resolution,
+                    local_bindings,
+                    step_result_type,
+                    gren_syntax_node_unbox(next_node),
+                    recursion_depth + 1,
+                ),
+                None => Some(step_result_type),
+            }
+        }
+        _ => local_binding_piped_step_result_type(
+            type_resolution,
+            local_bindings,
+            chain_unparenthesized,
+            maybe_piped_value_type.as_ref(),
+            recursion_depth + 1,
+        ),
+    }
+}
+
+// like local_binding_pipeline_value_type, but the piped value is already
+// a type: only the remaining chain links are walked
+fn local_binding_pipeline_value_type_from_piped_type(
+    type_resolution: &LocalBindingTypeResolution,
+    local_bindings: &GrenLocalBindings,
+    piped_value_type: GrenResolvedTypeInModule,
+    chain_node: GrenSyntaxNode<&GrenSyntaxExpression>,
+    recursion_depth: u8,
+) -> Option<GrenResolvedTypeInModule> {
+    if recursion_depth >= local_type_resolution_recursion_depth_limit {
+        return None;
+    }
+    let chain_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+        match chain_node.value {
+            GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                gren_syntax_node_unbox(in_parens_node)
+            }
+            _ => chain_node,
+        };
+    match chain_unparenthesized.value {
+        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+            left: step_node,
+            operator: step_operator,
+            right: maybe_next_node,
+        } if step_operator.value == "|>" => {
+            let step_unparenthesized: GrenSyntaxNode<&GrenSyntaxExpression> =
+                match step_node.value.as_ref() {
+                    GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                        gren_syntax_node_unbox(in_parens_node)
+                    }
+                    _ => gren_syntax_node_unbox(step_node),
+                };
+            let step_result_type: GrenResolvedTypeInModule =
+                local_binding_piped_step_result_type(
+                    type_resolution,
+                    local_bindings,
+                    step_unparenthesized,
+                    Some(&piped_value_type),
+                    recursion_depth + 1,
+                )?;
+            match maybe_next_node {
+                Some(next_node) => local_binding_pipeline_value_type_from_piped_type(
+                    type_resolution,
+                    local_bindings,
+                    step_result_type,
+                    gren_syntax_node_unbox(next_node),
+                    recursion_depth + 1,
+                ),
+                None => Some(step_result_type),
+            }
+        }
+        _ => local_binding_piped_step_result_type(
+            type_resolution,
+            local_bindings,
+            chain_unparenthesized,
+            Some(&piped_value_type),
+            recursion_depth + 1,
+        ),
+    }
+}
+
 fn local_binding_expression_type(
     type_resolution: &LocalBindingTypeResolution,
     local_bindings: &GrenLocalBindings,
@@ -4858,7 +5622,7 @@ fn local_binding_expression_type(
     match expression_node.value {
         GrenSyntaxExpression::Call {
             called,
-            argument0: _,
+            argument0,
             argument1_up,
         } => {
             let called_type: GrenResolvedTypeInModule = local_binding_expression_type(
@@ -4867,15 +5631,54 @@ fn local_binding_expression_type(
                 gren_syntax_node_unbox(called),
                 recursion_depth + 1,
             )?;
-            gren_syntax_type_result_after_applications(
+            // refine type variables in the result type from the arguments'
+            // value types, e.g. `Task.succeed value` gives `Task x value's type`
+            // instead of the bare `Task x a`
+            let argument_nodes: Vec<GrenSyntaxNode<&GrenSyntaxExpression>> =
+                std::iter::once(gren_syntax_node_unbox(argument0))
+                    .chain(argument1_up.iter().map(gren_syntax_node_as_ref))
+                    .collect::<Vec<_>>();
+            let mut type_substitutions: GrenTypeSubstitutions = Vec::new();
+            for (argument_index, argument_node) in argument_nodes.iter().enumerate() {
+                let Some(argument_parameter_type) = gren_syntax_type_function_parameter_at_index(
+                    GrenSyntaxNode {
+                        range: lsp_types::Range::default(),
+                        value: &called_type.type_,
+                    },
+                    argument_index,
+                ) else {
+                    continue;
+                };
+                local_binding_unify_argument_value_type_into(
+                    type_resolution,
+                    local_bindings,
+                    &mut type_substitutions,
+                    &argument_parameter_type,
+                    *argument_node,
+                    recursion_depth + 1,
+                );
+            }
+            let result_type: Box<GrenSyntaxType> = gren_syntax_type_result_after_applications(
                 GrenSyntaxNode {
                     range: lsp_types::Range::default(),
                     value: &called_type.type_,
                 },
-                1 + argument1_up.len(),
-            )
-            .map(|result_type| GrenResolvedTypeInModule {
-                type_: result_type,
+                argument_nodes.len(),
+            )?;
+            let refined_result_type: Box<GrenSyntaxType> = if type_substitutions.is_empty() {
+                result_type
+            } else {
+                gren_syntax_type_substitute(
+                    GrenSyntaxNode {
+                        range: lsp_types::Range::default(),
+                        value: &result_type,
+                    },
+                    &type_substitutions,
+                    0,
+                )
+            };
+            Some(GrenResolvedTypeInModule {
+                type_: refined_result_type,
                 origin_module: called_type.origin_module.clone(),
             })
         }
@@ -4919,10 +5722,58 @@ fn local_binding_expression_type(
                 )
             }),
         GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
-            left: _,
+            left,
             operator,
-            right: _,
+            right: maybe_right,
         } => {
+            // `value |> function argument1 ...` types like `function argument1 ... value`:
+            // refine the result type from the arguments and the piped value
+            // instead of the bare `|>` operator type
+            if operator.value == "|>" && let Some(right_node) = maybe_right {
+                let maybe_pipeline_value_type: Option<GrenResolvedTypeInModule> =
+                    match right_node.value.as_ref() {
+                        GrenSyntaxExpression::Parenthesized(Some(in_parens_node)) => {
+                            local_binding_pipeline_value_type(
+                                type_resolution,
+                                local_bindings,
+                                gren_syntax_node_unbox(left),
+                                gren_syntax_node_unbox(in_parens_node),
+                                recursion_depth + 1,
+                            )
+                        }
+                        GrenSyntaxExpression::InfixOperationIgnoringPrecedence {
+                            left: _,
+                            operator: right_operator,
+                            right: _,
+                        } if right_operator.value == "|>" => local_binding_pipeline_value_type(
+                            type_resolution,
+                            local_bindings,
+                            gren_syntax_node_unbox(left),
+                            gren_syntax_node_unbox(right_node),
+                            recursion_depth + 1,
+                        ),
+                        GrenSyntaxExpression::Call { .. }
+                        | GrenSyntaxExpression::Reference { .. } => {
+                            local_binding_piped_step_result_type(
+                                type_resolution,
+                                local_bindings,
+                                gren_syntax_node_unbox(right_node),
+                                local_binding_expression_type(
+                                    type_resolution,
+                                    local_bindings,
+                                    gren_syntax_node_unbox(left),
+                                    recursion_depth + 1,
+                                )
+                                .as_ref(),
+                                recursion_depth + 1,
+                            )
+                        }
+                        _ => None,
+                    };
+                if maybe_pipeline_value_type.is_some() {
+                    return maybe_pipeline_value_type;
+                }
+            }
             let operator_function_type: GrenResolvedTypeInModule =
                 local_binding_operator_function_type(type_resolution, operator.value)?;
             gren_syntax_type_result_after_applications(
