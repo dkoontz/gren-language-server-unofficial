@@ -347,9 +347,14 @@ fn update_state_on_did_open_text_document(
                 .iter()
                 .any(|source_dir| opened_path.starts_with(source_dir))
             {
-                project_state.modules.entry(opened_path).or_insert_with(|| {
-                    initialize_module_state_from_source(arguments.text_document.text)
-                });
+                // didOpen text is the authoritative buffer content: a restored
+                // unsaved buffer can differ from what startup indexing read from
+                // disk. Overwrite any disk-indexed state, otherwise incremental
+                // didChange positions desync and corrupt the document.
+                project_state.modules.insert(
+                    opened_path,
+                    initialize_module_state_from_source(arguments.text_document.text),
+                );
                 break 'adding_module_if_necessary;
             }
         }
