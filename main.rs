@@ -13500,6 +13500,22 @@ fn gren_syntax_expression_not_parenthesized_into(
             right: maybe_right,
         } => {
             let line_span: LineSpan = gren_syntax_expression_line_span(comments, expression_node);
+            // A `|>` chain that continues a multi-line expression (e.g. a call
+            // whose arguments each sit on their own line) indents one level
+            // deeper than usual. Otherwise the `|>` steps would sit at the
+            // same indentation as the left side's last argument, which reads
+            // like more arguments of the call instead of one pipeline.
+            let chain_indent: usize =
+                if operator_node.value == "|>"
+                    && gren_syntax_expression_line_span(
+                        comments,
+                        gren_syntax_node_unbox(left_node),
+                    ) == LineSpan::Multiple
+                {
+                    next_indent(next_indent(indent))
+                } else {
+                    next_indent(indent)
+                };
             gren_syntax_expression_parenthesized_if_not_call_but_space_separated_into(
                 so_far,
                 indent,
@@ -13508,7 +13524,7 @@ fn gren_syntax_expression_not_parenthesized_into(
             );
             match maybe_right {
                 None => {
-                    space_or_linebreak_indented_into(so_far, line_span, next_indent(indent));
+                    space_or_linebreak_indented_into(so_far, line_span, chain_indent);
                     let comments_before_operator = gren_syntax_comments_in_range(
                         comments,
                         lsp_types::Range {
@@ -13517,22 +13533,22 @@ fn gren_syntax_expression_not_parenthesized_into(
                         },
                     );
                     if !comments_before_operator.is_empty() {
-                        linebreak_indented_into(so_far, next_indent(indent));
+                        linebreak_indented_into(so_far, chain_indent);
                         gren_syntax_comments_then_linebreak_indented_into(
                             so_far,
-                            next_indent(indent),
+                            chain_indent,
                             comments_before_operator,
                         );
                     }
                     so_far.push_str(operator_node.value);
                 }
                 Some(right_node) => {
-                    space_or_linebreak_indented_into(so_far, line_span, next_indent(indent));
+                    space_or_linebreak_indented_into(so_far, line_span, chain_indent);
                     so_far.push_str(operator_node.value);
                     so_far.push(' ');
                     gren_syntax_comments_then_linebreak_indented_into(
                         so_far,
-                        next_indent(indent) + operator_node.value.len() + 1,
+                        chain_indent + operator_node.value.len() + 1,
                         gren_syntax_comments_in_range(
                             comments,
                             lsp_types::Range {
@@ -13553,21 +13569,21 @@ fn gren_syntax_expression_not_parenthesized_into(
                             } => {
                                 gren_syntax_expression_parenthesized_if_not_call_but_space_separated_into(
                                     so_far,
-                                    next_indent(indent) + next_right_operator_node.value.len() + 1,
+                                    chain_indent + next_right_operator_node.value.len() + 1,
                                     comments,
                                     gren_syntax_node_unbox(next_right_left_node),
                                 );
                                 space_or_linebreak_indented_into(
                                     so_far,
                                     line_span,
-                                    next_indent(indent),
+                                    chain_indent,
                                 );
                                 match maybe_next_right_right {
                                     None => {
-                                        linebreak_indented_into(so_far, next_indent(indent));
+                                        linebreak_indented_into(so_far, chain_indent);
                                         gren_syntax_comments_then_linebreak_indented_into(
                                             so_far,
-                                            next_indent(indent),
+                                            chain_indent,
                                             gren_syntax_comments_in_range(
                                                 comments,
                                                 lsp_types::Range {
@@ -13584,7 +13600,7 @@ fn gren_syntax_expression_not_parenthesized_into(
                                         so_far.push(' ');
                                         gren_syntax_comments_then_linebreak_indented_into(
                                             so_far,
-                                            next_indent(indent)
+                                            chain_indent
                                                 + next_right_operator_node.value.len()
                                                 + 1,
                                             gren_syntax_comments_in_range(
@@ -13603,7 +13619,7 @@ fn gren_syntax_expression_not_parenthesized_into(
                             _ => {
                                 gren_syntax_expression_parenthesized_if_not_call_but_space_separated_into(
                                     so_far,
-                                    next_indent(indent) + previous_operator.len() + 1,
+                                    chain_indent + previous_operator.len() + 1,
                                     comments,
                                     gren_syntax_node_unbox(next_right_node),
                                 );

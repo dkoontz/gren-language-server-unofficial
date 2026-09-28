@@ -1,0 +1,10 @@
+module PipeChainSingleLineLeftStaysAtNextIndent exposing (..)
+
+
+sendHttpResponse responseToken response =
+    response.headers
+        |> Array.foldl
+            (\accessToken header acc -> accessToken)
+            []
+        |> HttpResponse.setStatus response.status
+        |> HttpResponse.send

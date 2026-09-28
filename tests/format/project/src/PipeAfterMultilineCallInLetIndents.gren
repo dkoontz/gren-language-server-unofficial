@@ -1,0 +1,15 @@
+module PipeAfterMultilineCallInLetIndents exposing (..)
+
+
+mapping =
+    let
+        article =
+            Db.mapping "articles"
+                { column = "schema_version"
+                , current = 3
+                }
+                buildArticleV3
+            |> Db.key "id" Db.Serial
+            |> Db.finish
+    in
+    article

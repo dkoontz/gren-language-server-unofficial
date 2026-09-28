@@ -1,0 +1,13 @@
+module OtherInfixAfterMultilineCallStaysAtNextIndent exposing (..)
+
+
+greeting =
+    String.concat "Hello "
+        name
+        ++ "!"
+
+
+pipeChainAfterSingleLineCallIndentsOnce =
+    decodeRegisterUser
+        |> Decode.map RegisterUser
+        |> Task.mapError HttpError

@@ -1,0 +1,22 @@
+module PipeChainAfterMultilineCallIndents exposing (..)
+
+
+articleV3 : Mapping ArticleV3
+articleV3 =
+    Db.mapping "articles"
+        { column = "schema_version"
+        , current = 3
+        , history = [ Db.upgradeFrom 2 articleV2 upgradeV2toV3 ]
+        }
+        buildArticleV3
+        |> Db.key "id" Db.Serial
+        |> Db.text "slug" .slug
+        |> Db.childRows
+            { table = "article_tags"
+            , foreignKey = "article_id"
+            , order = Just "position"
+            , valueColumn = "tag"
+            }
+            .tagList
+        |> Db.timestamp "created_at" .createdAt
+        |> Db.finish
