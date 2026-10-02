@@ -6,7 +6,7 @@ use zed_extension_api::{
 const REPO: &str = "dkoontz/gren-language-server-unofficial";
 // const REPO: &str = "lue-bird/gren-language-server-unofficial";
 
-const VERSION: &str = "0.0.4";
+const VERSION: &str = "0.0.5";
 
 const BIN_NAME: &str = "gren-language-server-unofficial";
 const DOWNLOAD_DIR: &str = "lsp";
